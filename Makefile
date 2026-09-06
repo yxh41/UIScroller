@@ -12,7 +12,7 @@ $(TWEAK_NAME)_FRAMEWORKS = UIKit
 ARCHS = arm64e arm64
 FINALPACKAGE = 1
 TARGET = iphone:clang:latest:14.0
-INSTALL_TARGET_PROCESSES = SpringBoard
+INSTALL_TARGET_PROCESSES = backboardd
 
 # build for rootful, rootless, or roothide
 THEOS_PACKAGE_SCHEME = roothide
