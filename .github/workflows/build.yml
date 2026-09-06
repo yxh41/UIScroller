@@ -1,0 +1,53 @@
+name: Build UIScroller (roothide)
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      THEOS: ${{ github.workspace }}/theos
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fakeroot dpkg-deb ldid git ca-certificates xz-utils unzip
+
+      - name: Set up Theos
+        run: |
+          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+
+      - name: Download iOS 16.5 SDK (patched, includes private frameworks)
+        run: |
+          git clone --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
+          (cd /tmp/sdks && git sparse-checkout set iPhoneOS16.5.sdk)
+          mkdir -p "$THEOS/sdks"
+          cp -r /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+
+      - name: Build package (roothide)
+        run: |
+          make clean
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+
+      - name: Publish deb to ci-artifacts-roothide
+        run: |
+          DEB=$(find . -name '*.deb' -not -path './theos/*' -not -path './.git/*' | head -1)
+          echo "Built deb: $DEB"
+          test -n "$DEB" || { echo "ERROR: no deb produced"; exit 1; }
+          cp "$DEB" UIScroller_1.0.6_roothide.deb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan ci-artifacts-roothide
+          git rm -rf --cached . >/dev/null 2>&1
+          git add UIScroller_1.0.6_roothide.deb
+          git commit -m "CI: UIScroller 1.0.6 roothide build"
+          git push --force origin ci-artifacts-roothide
