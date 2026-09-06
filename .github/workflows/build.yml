@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            fakeroot dpkg-deb ldid git ca-certificates xz-utils unzip
+            fakeroot dpkg-deb git ca-certificates xz-utils unzip
 
       - name: Set up Theos
         run: |
@@ -32,6 +32,12 @@ jobs:
           (cd /tmp/sdks && git sparse-checkout set iPhoneOS16.5.sdk)
           mkdir -p "$THEOS/sdks"
           cp -r /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+
+      - name: Provide ldid shim (no-op signing; unsigned tweak dylib is fine for sideload)
+        run: |
+          printf '#!/bin/sh\n# no-op ldid shim for CI builds (unsigned tweak dylib)\nexit 0\n' | sudo tee /usr/local/bin/ldid >/dev/null
+          sudo chmod +x /usr/local/bin/ldid
+          command -v ldid
 
       - name: Build package (roothide)
         run: |
