@@ -53,8 +53,22 @@ jobs:
 
       - name: Build package (roothide)
         run: |
+          set -o pipefail
           make clean
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide
+          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide 2>&1 | tee build.log
+
+      - name: Publish build log (debug)
+        if: always()
+        run: |
+          if [ -f build.log ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git checkout --orphan ci-debug
+            git rm -rf --cached . >/dev/null 2>&1
+            git add build.log
+            git commit -m "CI debug: build log"
+            git push --force origin ci-debug
+          fi
 
       - name: Publish deb to ci-artifacts-roothide
         run: |
