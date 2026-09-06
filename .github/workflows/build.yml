@@ -59,6 +59,8 @@ jobs:
 
       - name: Publish build log (debug)
         if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if [ -f build.log ]; then
             git config user.name "github-actions[bot]"
@@ -67,7 +69,7 @@ jobs:
             git rm -rf --cached . >/dev/null 2>&1
             git add build.log
             git commit -m "CI debug: build log"
-            git push --force origin ci-debug
+            git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-debug
           fi
 
       - name: Publish deb to ci-artifacts-roothide
