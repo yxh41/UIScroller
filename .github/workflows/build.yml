@@ -20,18 +20,30 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            fakeroot dpkg-deb git ca-certificates xz-utils unzip
+            fakeroot rsync curl perl git ca-certificates \
+            xz-utils unzip build-essential libxml2 libtinfo6
+          # The prebuilt iOS toolchain is built against libtinfo.so.5/6;
+          # symlink so it resolves regardless of the exact minor version.
+          sudo ln -sf "$(find /usr/lib/x86_64-linux-gnu -name 'libtinfo.so.6*' | head -1)" \
+                       /usr/lib/x86_64-linux-gnu/libtinfo.so.5 2>/dev/null || true
 
       - name: Set up Theos
         run: |
           git clone --recursive https://github.com/theos/theos.git "$THEOS"
 
+      - name: Install iOS toolchain (Linux, Mach-O capable clang + ld)
+        run: |
+          mkdir -p "$THEOS/toolchain"
+          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
+            | sudo tar -xJvf - -C "$THEOS/toolchain/"
+          "$THEOS/toolchain/linux/iphone/bin/clang" --version
+
       - name: Download iOS 16.5 SDK (patched, includes private frameworks)
         run: |
-          git clone --filter=blob:none --sparse https://github.com/theos/sdks.git /tmp/sdks
-          (cd /tmp/sdks && git sparse-checkout set iPhoneOS16.5.sdk)
           mkdir -p "$THEOS/sdks"
-          cp -r /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          curl -sL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz \
+            | tar -xJvf - -C "$THEOS/sdks/"
+          ls -d "$THEOS/sdks"/*.sdk
 
       - name: Provide ldid shim (no-op signing; unsigned tweak dylib is fine for sideload)
         run: |
