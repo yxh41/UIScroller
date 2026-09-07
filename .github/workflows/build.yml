@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      issues: write
     env:
       THEOS: ${{ github.workspace }}/theos
     steps:
@@ -63,13 +64,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ -f build.log ]; then
+            tail -n 150 build.log > /tmp/bl.txt
+            # Primary: create a public issue so the error is readable via the API.
+            gh issue create --title "CI build log (debug)" --body-file /tmp/bl.txt --repo "${{ github.repository }}" || true
+            # Fallback: branch push.
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git checkout --orphan ci-debug
-            git rm -rf --cached . >/dev/null 2>&1
-            git add build.log
-            git commit -m "CI debug: build log"
-            git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-debug
+            git checkout --orphan ci-debug || git checkout ci-debug
+            git rm -rf --cached . >/dev/null 2>&1 || true
+            git add -f build.log || true
+            git commit -m "CI debug: build log" || true
+            git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-debug || true
           fi
 
       - name: Publish deb to ci-artifacts-roothide
