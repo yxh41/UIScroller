@@ -1,92 +1,87 @@
 name: Build UIScroller (roothide)
 
+# 在 GitHub macOS runner 上用 roothide 官方 theos 分支直接构建 roothide .deb：
+#   1) clone roothide/theos（内置 roothide package scheme；主线和 theos/theos 没有 roothide scheme，会导致 make package 失败）
+#   2) make package 直接产出 iphoneos-arm64e 的 roothide .deb（无需 patch.sh / RootHidePatcher）
+# 错误通过 ::error:: 注解直接显示在 Actions 日志，并上传 .deb 为 artifact 可直接下载。
+# 参考同作者 手势(Oback) 验证通过的 roothide 构建配置。
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
 
+env:
+  THEOS: ${{ github.workspace }}/theos
+
 jobs:
   build:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      issues: write
-    env:
-      THEOS: ${{ github.workspace }}/theos
+    runs-on: macos-15
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            fakeroot rsync curl perl git ca-certificates \
-            xz-utils unzip build-essential libxml2 libtinfo6
-          # The prebuilt iOS toolchain is built against libtinfo.so.5/6;
-          # symlink so it resolves regardless of the exact minor version.
-          sudo ln -sf "$(find /usr/lib/x86_64-linux-gnu -name 'libtinfo.so.6*' | head -1)" \
-                       /usr/lib/x86_64-linux-gnu/libtinfo.so.5 2>/dev/null || true
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer 2>/dev/null || true
 
-      - name: Set up Theos
+      - name: Install dependencies
         run: |
-          git clone --recursive https://github.com/theos/theos.git "$THEOS"
+          brew install dpkg ldid gnu-sed findutils coreutils xz
+          cpanm -n IO::Compress::Lzma 2>/dev/null || true
 
-      - name: Install iOS toolchain (Linux, Mach-O capable clang + ld)
+      - name: Install Theos (roothide fork)
         run: |
-          mkdir -p "$THEOS/toolchain"
-          curl -sL https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz \
-            | sudo tar -xJvf - -C "$THEOS/toolchain/"
-          "$THEOS/toolchain/linux/iphone/bin/clang" --version
+          git clone --recursive https://github.com/roothide/theos.git "$THEOS"
+          for f in logos.pl dm.pl; do
+            [ -e "$THEOS/bin/$f" ] && continue
+            case "$f" in
+              logos.pl) curl -fsSL https://raw.githubusercontent.com/theos/logos/master/logos.pl -o "$THEOS/bin/logos.pl" ;;
+              dm.pl)    curl -fsSL https://raw.githubusercontent.com/theos/dm.pl/master/dm.pl -o "$THEOS/bin/dm.pl" ;;
+            esac
+            chmod +x "$THEOS/bin/$f"
+          done
 
-      - name: Download iOS 16.5 SDK (patched, includes private frameworks)
+      - name: Install SDKs
         run: |
-          mkdir -p "$THEOS/sdks"
-          curl -sL https://github.com/theos/sdks/releases/latest/download/iPhoneOS16.5.sdk.tar.xz \
-            | tar -xJvf - -C "$THEOS/sdks/"
-          ls -d "$THEOS/sdks"/*.sdk
+          rm -rf "$THEOS/sdks"
+          git clone --depth=1 https://github.com/theos/sdks.git "$THEOS/sdks"
+          ls -1 "$THEOS/sdks/" | grep -i iphone
 
-      - name: Provide ldid shim (no-op signing; unsigned tweak dylib is fine for sideload)
+      - name: Detect SDK version
+        id: sdk
         run: |
-          printf '#!/bin/sh\n# no-op ldid shim for CI builds (unsigned tweak dylib)\nexit 0\n' | sudo tee /usr/local/bin/ldid >/dev/null
-          sudo chmod +x /usr/local/bin/ldid
-          command -v ldid
+          SDK=$(ls "$THEOS/sdks/" | grep -o 'iPhoneOS[0-9.]*\.sdk' | sed 's/iPhoneOS//;s/\.sdk//' | sort -V | tail -1)
+          echo "sdk_version=$SDK" >> "$GITHUB_OUTPUT"
+          echo "Detected latest SDK: $SDK"
+          sed -i '' "s|^TARGET.*|TARGET := iphone:clang:$SDK:14.0|" Makefile
+          echo "Makefile TARGET now:"
+          grep '^TARGET' Makefile
 
-      - name: Build package (roothide)
+      - name: Build roothide .deb
         run: |
           set -o pipefail
           make clean
-          make package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=roothide 2>&1 | tee build.log
+          make package FINALPACKAGE=1 THEOS_ENV=silent 2>&1 | tee ci-build.log || make package FINALPACKAGE=1 2>&1 | tee ci-build.log
+          # 把编译错误转成 GitHub Actions 注解（::error::），便于直接读取定位未声明符号
+          grep -iE "error:|undeclared identifier|No such file" ci-build.log | sed 's|^|::error::|' || true
+          ROOTHIDE_DEB=$(ls packages/*_iphoneos-arm64e.deb 2>/dev/null | head -n1)
+          echo "ROOTHIDE_DEB=$ROOTHIDE_DEB"
+          [ -n "$ROOTHIDE_DEB" ] || { echo "No roothide .deb produced"; exit 1; }
+          ls -la "$ROOTHIDE_DEB"
+          dpkg-deb -I "$ROOTHIDE_DEB" | head -20
+          BUILT_VER=$(dpkg-deb -f "$ROOTHIDE_DEB" Version 2>/dev/null)
+          echo "::notice::UIScroller package version = ${BUILT_VER:-UNKNOWN}"
 
-      - name: Publish build log (debug)
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Echo build errors as annotations
+        if: failure()
         run: |
-          if [ -f build.log ]; then
-            tail -n 150 build.log > /tmp/bl.txt
-            # Primary: create a public issue so the error is readable via the API.
-            gh issue create --title "CI build log (debug)" --body-file /tmp/bl.txt --repo "${{ github.repository }}" || true
-            # Fallback: branch push.
-            git config user.name "github-actions[bot]"
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git checkout --orphan ci-debug || git checkout ci-debug
-            git rm -rf --cached . >/dev/null 2>&1 || true
-            git add -f build.log || true
-            git commit -m "CI debug: build log" || true
-            git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-debug || true
-          fi
+          grep -iE "error:|undeclared identifier|No such file" ci-build.log | sed 's|^|::error::|' || true
 
-      - name: Publish deb to ci-artifacts-roothide
-        run: |
-          DEB=$(find . -name '*.deb' -not -path './theos/*' -not -path './.git/*' | head -1)
-          echo "Built deb: $DEB"
-          test -n "$DEB" || { echo "ERROR: no deb produced"; exit 1; }
-          cp "$DEB" UIScroller_1.0.6_roothide.deb
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan ci-artifacts-roothide
-          git rm -rf --cached . >/dev/null 2>&1
-          git add UIScroller_1.0.6_roothide.deb
-          git commit -m "CI: UIScroller 1.0.6 roothide build"
-          git push --force origin ci-artifacts-roothide
+      - name: Upload roothide .deb
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uiscroller-deb
+          path: packages/*_iphoneos-arm64e.deb
+          if-no-files-found: error
+          retention-days: 90
