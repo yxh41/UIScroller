@@ -155,7 +155,7 @@ jobs:
           DEB=$(ls packages/*_iphoneos-arm64e.deb 2>/dev/null | head -n1)
           if [ -n "$DEB" ]; then
             echo "::group::UIScroller roothide .deb (base64) — copy all lines below, decode on Windows"
-            base64 "$DEB"
+            base64 -i "$DEB" || echo "base64 emit failed; download artifact uiscroller-deb instead"
             echo "::endgroup::"
             echo "::notice::Windows decode: certutil -decode uiscroller.b64 uiscroller.deb"
           else
