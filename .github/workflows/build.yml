@@ -79,11 +79,9 @@ jobs:
             echo "===== ci-build.log (tail 40) ====="
             tail -n 40 ci-build.log
             echo "===== emitting file-anchored ::error:: annotations (retrievable via API) ====="
-            i=1
-            tail -n 40 ci-build.log | while IFS= read -r line; do
-              printf '::error file=ci-build.log,line=%d::%s\n' "$i" "$line" || true
-              i=$((i+1))
-            done
+            # NOTE: prefix with sed (NOT printf %s) so '%' chars in the log
+            # (e.g. '100%', 'error: %s') don't break the ::error:: command parsing.
+            tail -n 40 ci-build.log | sed 's|^|::error file=ci-build.log::|'
           else
             echo "ci-build.log not found"
           fi
