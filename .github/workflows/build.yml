@@ -145,3 +145,19 @@ jobs:
           path: packages/*_iphoneos-arm64e.deb
           if-no-files-found: error
           retention-days: 90
+
+      # Token-free fallback: even with a read-only GITHUB_TOKEN the built .deb
+      # is unreadable via artifacts/branches/statuses, so emit it as base64 that
+      # the repo owner can copy straight from the Actions log and decode locally.
+      - name: Emit roothide .deb as base64 (token-free fallback)
+        if: always()
+        run: |
+          DEB=$(ls packages/*_iphoneos-arm64e.deb 2>/dev/null | head -n1)
+          if [ -n "$DEB" ]; then
+            echo "::group::UIScroller roothide .deb (base64) — copy all lines below, decode on Windows"
+            base64 "$DEB"
+            echo "::endgroup::"
+            echo "::notice::Windows decode: certutil -decode uiscroller.b64 uiscroller.deb"
+          else
+            echo "No roothide .deb produced; nothing to emit."
+          fi

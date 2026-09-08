@@ -7,6 +7,8 @@
 - (void)stopUIScroller;
 - (void)autoScroll;
 - (void)handleTaps:(UITapGestureRecognizer *)gesture;
+- (void)stopAutoDisableTimer;
+- (void)autoDisableScrolling;
 @end
 
 // per-instance 状态存在 associated object 上，避免全局单例导致的：
