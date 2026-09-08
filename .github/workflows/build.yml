@@ -72,10 +72,28 @@ jobs:
           BUILT_VER=$(dpkg-deb -f "$ROOTHIDE_DEB" Version 2>/dev/null)
           echo "::notice::UIScroller package version = ${BUILT_VER:-UNKNOWN}"
 
-      - name: Echo build errors as annotations
+      - name: Echo build log tail as annotations (agent-readable)
         if: failure()
         run: |
-          grep -iE "error:|undeclared identifier|No such file" ci-build.log | sed 's|^|::error::|' || true
+          if [ -f ci-build.log ]; then
+            echo "===== ci-build.log (tail 60) ====="
+            tail -n 50 ci-build.log
+            echo "===== emitting as ::error:: annotations for retrieval ====="
+            tail -n 50 ci-build.log | while IFS= read -r line; do
+              printf '::error::%s\n' "$line" || true
+            done
+          else
+            echo "ci-build.log not found"
+          fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uiscroller-buildlog
+          path: ci-build.log
+          if-no-files-found: warn
+          retention-days: 90
 
       - name: Upload roothide .deb
         if: success()
