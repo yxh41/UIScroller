@@ -76,11 +76,13 @@ jobs:
         if: failure()
         run: |
           if [ -f ci-build.log ]; then
-            echo "===== ci-build.log (tail 60) ====="
-            tail -n 50 ci-build.log
-            echo "===== emitting as ::error:: annotations for retrieval ====="
-            tail -n 50 ci-build.log | while IFS= read -r line; do
-              printf '::error::%s\n' "$line" || true
+            echo "===== ci-build.log (tail 40) ====="
+            tail -n 40 ci-build.log
+            echo "===== emitting file-anchored ::error:: annotations (retrievable via API) ====="
+            i=1
+            tail -n 40 ci-build.log | while IFS= read -r line; do
+              printf '::error file=ci-build.log,line=%d::%s\n' "$i" "$line" || true
+              i=$((i+1))
             done
           else
             echo "ci-build.log not found"
