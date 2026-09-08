@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 
 @interface UIScrollView (UIScroller)
@@ -9,6 +10,18 @@
 - (void)handleTaps:(UITapGestureRecognizer *)gesture;
 - (void)stopAutoDisableTimer;
 - (void)autoDisableScrolling;
+@end
+
+// CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
+// 否则 self -> associatedObject(link) -> proxy -> self 形成 retain cycle 无法释放。
+@interface UIScrollerTickProxy : NSObject
+@property (nonatomic, weak) UIScrollView *scrollView;
+- (void)tick:(CADisplayLink *)link;
+@end
+@implementation UIScrollerTickProxy
+- (void)tick:(CADisplayLink *)link {
+    [self.scrollView autoScroll];
+}
 @end
 
 // per-instance 状态存在 associated object 上，避免全局单例导致的：
@@ -42,6 +55,10 @@ id topViewController() {
     UIViewController *rootController = keyWindow.rootViewController;
     UIViewController *topController = rootController;
     while (topController.presentedViewController) topController = topController.presentedViewController;
+    if ([topController isKindOfClass:[UITabBarController class]]) {
+        UIViewController *selected = ((UITabBarController *)topController).selectedViewController;
+        if (selected) topController = selected;
+    }
     if ([topController isKindOfClass:[UINavigationController class]]) {
         UIViewController *visibleController = ((UINavigationController *)topController).visibleViewController;
         if (visibleController) topController = visibleController;
@@ -114,6 +131,8 @@ void openSimpleMenu() {
     - (void)becomeKeyWindow {
         %orig;
         if (objc_getAssociatedObject(self, kMenuAddedKey)) return; // 去重：每个 window 只加一次
+        // 只给主窗口（normal level）加菜单手势，避开键盘/弹窗等高 level 窗口
+        if (self.windowLevel != UIWindowLevelNormal) return;
         UILongPressGestureRecognizer *menuGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
         menuGestureRecognizer.numberOfTouchesRequired = 4;
         [self addGestureRecognizer:menuGestureRecognizer];
@@ -121,7 +140,7 @@ void openSimpleMenu() {
     }
 
     %new
-    - (void)handleMenuLongPress:(UITapGestureRecognizer *)gesture {
+    - (void)handleMenuLongPress:(UILongPressGestureRecognizer *)gesture {
         openSimpleMenu();
     }
 
@@ -181,13 +200,14 @@ void openSimpleMenu() {
         [self stopUIScroller];
 
         __weak typeof(self) weakSelf = self;
-        // block 版 NSTimer：timer 强引用 block，block 只弱引用 self -> 打破原版对 UIScrollView 的强引用泄漏
-        NSTimer *t = [NSTimer scheduledTimerWithTimeInterval:0.01 repeats:YES block:^(NSTimer * _Nonnull timer){
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (strongSelf) [strongSelf autoScroll];
-        }];
-        [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
-        objc_setAssociatedObject(self, kScrollTimerKey, t, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
+        // link 强引用 proxy，proxy 只弱引用 self -> 无 retain cycle。
+        UIScrollerTickProxy *proxy = [[UIScrollerTickProxy alloc] init];
+        proxy.scrollView = self;
+        CADisplayLink *link = [CADisplayLink displayLinkWithTarget:proxy selector:@selector(tick:)];
+        link.preferredFramesPerSecond = 0; // 0 = 跟随屏幕原生刷新率
+        [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+        objc_setAssociatedObject(self, kScrollTimerKey, link, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         if (autoDisableMinutes > 0) {
             [self stopAutoDisableTimer];
@@ -201,7 +221,7 @@ void openSimpleMenu() {
 
     %new
     - (void)stopUIScroller {
-        NSTimer *t = objc_getAssociatedObject(self, kScrollTimerKey);
+        id t = objc_getAssociatedObject(self, kScrollTimerKey);
         if (t) {
             [t invalidate];
             objc_setAssociatedObject(self, kScrollTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -228,13 +248,22 @@ void openSimpleMenu() {
         else if (scrollSpeedType == 3) scrollSpeed = 2.0;
 
         BOOL vDown = [objc_getAssociatedObject(self, kVerticalDownKey) boolValue];
-        if (vDown) offset.y += scrollSpeed;
-        else offset.y -= scrollSpeed;
 
-        // 越界判断：用 bounds 高度（兼容 zoomScale），且只在真正滚到头时停。
-        // 短内容 (contentSize <= bounds) 时 maxOffset=0，offset.y 恒为 0，会立即停 -> 短内容不滚动（符合预期）。
-        CGFloat maxOffset = MAX(0, self.contentSize.height - CGRectGetHeight(self.bounds));
-        if ((vDown && offset.y >= maxOffset) || (!vDown && offset.y <= 0)) {
+        // 归一化到原 0.01s/100Hz 基准：不同刷新率下观感速度一致
+        // （60Hz 每帧多走、120Hz 每帧少走，单位时间位移不变）。
+        CADisplayLink *link = objc_getAssociatedObject(self, kScrollTimerKey);
+        NSTimeInterval frameDur = (link && link.duration > 0) ? link.duration : (1.0/60.0);
+        float delta = scrollSpeed * (float)(frameDur / 0.01);
+
+        if (vDown) offset.y += delta;
+        else offset.y -= delta;
+
+        // 越界判断：考虑 adjustedContentInset（iOS 11+ 安全区/导航栏/底部 home 指示条），
+        // 否则在带 inset 的 scroll view 上会提前停或越界一点。
+        UIEdgeInsets insets = self.adjustedContentInset;
+        CGFloat minOffset = -insets.top;
+        CGFloat maxOffset = MAX(minOffset, self.contentSize.height + insets.bottom - CGRectGetHeight(self.bounds));
+        if ((vDown && offset.y >= maxOffset) || (!vDown && offset.y <= minOffset)) {
             [self stopUIScroller];
             return;
         }
