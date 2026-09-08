@@ -115,7 +115,7 @@ void openSimpleMenu() {
         %orig;
         if (objc_getAssociatedObject(self, kMenuAddedKey)) return; // 去重：每个 window 只加一次
         UILongPressGestureRecognizer *menuGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
-        menuGestureRecognizer.numberOfTouchesRequired = 2;
+        menuGestureRecognizer.numberOfTouchesRequired = 4;
         [self addGestureRecognizer:menuGestureRecognizer];
         objc_setAssociatedObject(self, kMenuAddedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
