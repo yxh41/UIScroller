@@ -86,6 +86,24 @@ jobs:
             echo "ci-build.log not found"
           fi
 
+      - name: Publish build log to ci-debug branch (raw-readable)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f ci-build.log ]; then
+            git config user.email "ci@local"
+            git config user.name "CI"
+            git checkout --orphan ci-debug
+            git rm -rf --cached . >/dev/null 2>&1
+            git add -f ci-build.log
+            git commit -m "ci debug log ($(date -u))" 
+            git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-debug
+            echo "PUSHED ci-debug branch"
+          else
+            echo "no ci-build.log to push"
+          fi
+
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
