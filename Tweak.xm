@@ -285,7 +285,14 @@ void openSimpleMenu() {
         // 内容实际够不够滚：一屏就放得下的视图（微信下拉小程序面板等）不接管，
         // 否则会打断它自己的回弹/动画
         BOOL scrollable = (self.contentSize.height - CGRectGetHeight(self.bounds)) >= kMinScrollableTravel;
-        BOOL shouldTakeOver = !isDisabled && vertical && strongEnough && scrollable && !pickerLike;
+        // 回弹/越界区（顶部下拉、底部上拉）不接管：下拉刷新、微信聊天列表下拉呼出小程序面板
+        // 这类手势都发生在这里（列表被拉到 minOffset 以上），接管会让面板"缓慢爬"而不是正常弹出
+        UIEdgeInsets insets = self.adjustedContentInset;
+        CGFloat minOffsetNow = -insets.top;
+        CGFloat maxOffsetNow = MAX(minOffsetNow, self.contentSize.height + insets.bottom - CGRectGetHeight(self.bounds));
+        CGPoint cur = self.contentOffset;
+        BOOL inBounceZone = (cur.y < minOffsetNow) || (cur.y > maxOffsetNow);
+        BOOL shouldTakeOver = !isDisabled && vertical && strongEnough && scrollable && !inBounceZone && !pickerLike;
 
         if (shouldTakeOver) {
             // velocity.y > 0 表示手指向下滑 -> 继续向下滚 -> verticalDown = NO（保持原语义）
