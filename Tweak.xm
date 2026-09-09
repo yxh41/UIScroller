@@ -77,6 +77,10 @@ static const float kAutoChainTrigger = 250.0f;
 static const CFTimeInterval kAutoGlideTau = 2.0;
 // 停止阈值（pt/s）：衰减到该速度以下直接结束驱动（人眼已察觉不到在动）。
 static const float kAutoGlideStopSpeed = 10.0f;
+// 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
+// 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
+// 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
+static const float kAutoTriggerAuto = 300.0f;
 // 刹车时长（秒）：停止时做匀减速（像摩擦制动）滑到 0，而不是瞬间定住。
 // 0.35s 既刹得住又不会显得生硬；想要更干脆就调小。
 static const CFTimeInterval kBrakeDuration = 0.35;
@@ -312,7 +316,8 @@ void openSimpleMenu() {
             BOOL stopByTouch = [objc_getAssociatedObject(self, kStopByTouchKey) boolValue];
             objc_setAssociatedObject(self, kStopByTouchKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
-            BOOL strongEnough = fabs(velocity.y) >= kAutoTriggerVelocity && fabs(velocity.y) > fabs(velocity.x);
+            // 自动档触发阈值单独放低（300）：轻甩也延续，速度跟随力道；固定挡仍用 700
+            BOOL strongEnough = fabs(velocity.y) >= kAutoTriggerAuto && fabs(velocity.y) > fabs(velocity.x);
             BOOL chain = (bv >= kAutoChainTrigger) && !stopByTouch;
             if (!strongEnough && !chain) {
                 // 两种触发都不满足：留给系统自然减速
