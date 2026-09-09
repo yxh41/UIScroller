@@ -10,6 +10,8 @@
 - (void)handleTaps:(UITapGestureRecognizer *)gesture;
 - (void)stopAutoDisableTimer;
 - (void)autoDisableScrolling;
+- (void)attachStopTapGesture;
+- (void)detachStopTapGesture;
 @end
 
 // CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
@@ -30,7 +32,7 @@
 //   3) didMoveToWindow 反复 addGestureRecognizer 造成手势累积
 static const void *kScrollTimerKey      = &kScrollTimerKey;
 static const void *kAutoDisableTimerKey = &kAutoDisableTimerKey;
-static const void *kTapAddedKey         = &kTapAddedKey;
+static const void *kTapGestureKey       = &kTapGestureKey;
 static const void *kMenuAddedKey        = &kMenuAddedKey;
 static const void *kVerticalDownKey     = &kVerticalDownKey;
 
@@ -41,6 +43,22 @@ int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
 static NSString *disabledKey() {
     NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
     return [NSString stringWithFormat:@"uiscroller_disabled_%@", bid];
+}
+
+// 判断 scroll view 是否在 WKWebView/UIWebView 内部（往 WKScrollView 上挂 tap 会让网页输入框点不动）
+static BOOL scrollViewInsideWebView(UIScrollView *sv) {
+    static Class wkClass = nil;
+    static Class uiClass = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        wkClass = NSClassFromString(@"WKWebView");
+        uiClass = NSClassFromString(@"UIWebView");
+    });
+    if (!wkClass && !uiClass) return NO;
+    for (UIView *v = sv.superview; v; v = v.superview) {
+        if ((wkClass && [v isKindOfClass:wkClass]) || (uiClass && [v isKindOfClass:uiClass])) return YES;
+    }
+    return NO;
 }
 
 id topViewController() {
@@ -158,13 +176,13 @@ void openSimpleMenu() {
             return;
         }
 
-        // 去重：只在首次进 window 时加一次单点手势
-        if (objc_getAssociatedObject(self, kTapAddedKey)) return;
-        UITapGestureRecognizer *singleTapGestureRecognizer = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTaps:)];
-        singleTapGestureRecognizer.numberOfTapsRequired = 1;
-        singleTapGestureRecognizer.cancelsTouchesInView = NO;
-        [self addGestureRecognizer:singleTapGestureRecognizer];
-        objc_setAssociatedObject(self, kTapAddedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 按 App 禁用：连手势也不挂、并清掉残留。
+        // 之前 isDisabled 只在 _scrollViewWillBeginDragging 里拦"是否启动滚动"，
+        // 手势照挂不误 —— 这就是"设置里禁用了，输入框依然点不动"的原因。
+        if ([[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()]) {
+            [self detachStopTapGesture];
+            return;
+        }
     }
 
     - (void)_scrollViewWillBeginDragging {
@@ -190,6 +208,35 @@ void openSimpleMenu() {
         return r;
     }
 
+    // 只在"自动滚动进行中"挂 tap 手势（用于点一下停）。平时不挂，
+    // 避免在绝大多数非滚动场景下干扰 App 自身的点击（尤其是输入框）。
+    %new
+    - (void)attachStopTapGesture {
+        if (objc_getAssociatedObject(self, kTapGestureKey)) return;
+        if ([[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()]) return;
+        // UITextView 本身就是 UIScrollView 子类，额外 tap 会和它内部文本交互手势冲突 -> 点了没反应
+        if ([self isKindOfClass:[UITextView class]]) return;
+        // WKWebView 内部的 WKScrollView 挂 tap 会让网页输入框点不动
+        if (scrollViewInsideWebView(self)) return;
+
+        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTaps:)];
+        tap.numberOfTapsRequired = 1;
+        tap.cancelsTouchesInView = NO;
+        tap.delaysTouchesBegan = NO;
+        tap.delaysTouchesEnded = NO; // 关键：不延迟 touchesEnded，否则点击输入框会卡住/没反应
+        [self addGestureRecognizer:tap];
+        objc_setAssociatedObject(self, kTapGestureKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    %new
+    - (void)detachStopTapGesture {
+        UITapGestureRecognizer *tap = objc_getAssociatedObject(self, kTapGestureKey);
+        if (tap) {
+            [self removeGestureRecognizer:tap];
+            objc_setAssociatedObject(self, kTapGestureKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+
     %new
     - (void)handleTaps:(UITapGestureRecognizer *)gesture {
         [self stopUIScroller];
@@ -208,6 +255,8 @@ void openSimpleMenu() {
         link.preferredFramesPerSecond = 0; // 0 = 跟随屏幕原生刷新率
         [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
         objc_setAssociatedObject(self, kScrollTimerKey, link, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 挂上"点一下停止"的手势（只在滚动期间存在）
+        [self attachStopTapGesture];
 
         if (autoDisableMinutes > 0) {
             [self stopAutoDisableTimer];
@@ -226,6 +275,7 @@ void openSimpleMenu() {
             [t invalidate];
             objc_setAssociatedObject(self, kScrollTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
+        [self detachStopTapGesture];
     }
 
     %new
