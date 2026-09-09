@@ -192,7 +192,7 @@ void openSimpleMenu() {
         // 只给主窗口（normal level）加菜单手势，避开键盘/弹窗等高 level 窗口
         if (self.windowLevel != UIWindowLevelNormal) return;
         UILongPressGestureRecognizer *menuGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
-        menuGestureRecognizer.numberOfTouchesRequired = 4;
+        menuGestureRecognizer.numberOfTouchesRequired = 3;
         [self addGestureRecognizer:menuGestureRecognizer];
         objc_setAssociatedObject(self, kMenuAddedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
