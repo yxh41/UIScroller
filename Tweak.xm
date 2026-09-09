@@ -7,6 +7,7 @@
 @property (nonatomic,readonly) UIPanGestureRecognizer *panGestureRecognizer;
 - (void)startUIScroller;
 - (void)stopUIScroller;
+- (void)brakeUIScroller;
 - (void)autoScroll;
 - (void)handleTaps:(UITapGestureRecognizer *)gesture;
 - (void)stopAutoDisableTimer;
@@ -40,6 +41,8 @@ static const void *kDragVelocityKey     = &kDragVelocityKey;
 static const void *kScrollStartKey      = &kScrollStartKey;
 static const void *kScrollBaseOffsetKey = &kScrollBaseOffsetKey;
 static const void *kScrollTravelKey     = &kScrollTravelKey;
+static const void *kBrakingKey          = &kBrakingKey;
+static const void *kBrakeStartKey       = &kBrakeStartKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -63,6 +66,9 @@ static const float kAutoSpeedMax        = 400.0f;
 // 惯性收敛时间常数（秒）：接管瞬间速度 = 松手速度 V，随后按 e^(-t/tau) 平滑收敛到稳态速度。
 // 取 ~0.45s 与 iOS 自带减速的衰减尺度接近，看上去就是"惯性自然延续"，不会顿一下。
 static const CFTimeInterval kAutoEaseTau = 0.45;
+// 刹车时长（秒）：停止时做匀减速（像摩擦制动）滑到 0，而不是瞬间定住。
+// 0.35s 既刹得住又不会显得生硬；想要更干脆就调小。
+static const CFTimeInterval kBrakeDuration = 0.35;
 
 // per-app 禁用 key（原版用全局 key，UI 写 "Disable for this app" 但实际禁用所有 app）
 static NSString *disabledKey() {
@@ -308,7 +314,7 @@ void openSimpleMenu() {
 
     %new
     - (void)handleTaps:(UITapGestureRecognizer *)gesture {
-        [self stopUIScroller];
+        [self brakeUIScroller];
     }
 
     %new
@@ -349,7 +355,19 @@ void openSimpleMenu() {
             [t invalidate];
             objc_setAssociatedObject(self, kScrollTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
+        objc_setAssociatedObject(self, kBrakingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self detachStopTapGesture];
+    }
+
+    // 用户主动停止时走这里：进入刹车态，速度匀减速滑到 0 再真正停。
+    // 生命周期类停止（离屏 / 重新接管）仍用 stopUIScroller 立即停。
+    %new
+    - (void)brakeUIScroller {
+        // 已经在刹车中再触发一次 -> 直接定住，保证"想停就一定能马上停"
+        if (objc_getAssociatedObject(self, kBrakingKey)) { [self stopUIScroller]; return; }
+        if (!objc_getAssociatedObject(self, kScrollTimerKey)) { [self stopUIScroller]; return; }
+        objc_setAssociatedObject(self, kBrakingKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kBrakeStartKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
     %new
@@ -387,6 +405,14 @@ void openSimpleMenu() {
         float speed = steady + (float)((v0 - steady) * exp(-t / kAutoEaseTau));
         if (speed < 0.0f) speed = 0.0f;
 
+        // 刹车：匀减速（线性降到 0），像摩擦制动一样滑停，而不是瞬间定住
+        if ([objc_getAssociatedObject(self, kBrakingKey) boolValue]) {
+            CFTimeInterval bt = CACurrentMediaTime() - [objc_getAssociatedObject(self, kBrakeStartKey) doubleValue];
+            float k = 1.0f - (float)(bt / kBrakeDuration);
+            if (k <= 0.0f) { [self stopUIScroller]; return; }
+            speed *= k;
+        }
+
         // 位移由我们自己累计并绝对定位，不基于 self.contentOffset 累加，
         // 避免与 iOS 减速相互打断而产生抖动。
         CADisplayLink *link = objc_getAssociatedObject(self, kScrollTimerKey);
@@ -414,7 +440,7 @@ void openSimpleMenu() {
 
     %new
     - (void)autoDisableScrolling {
-        [self stopUIScroller];
+        [self brakeUIScroller];
         [self stopAutoDisableTimer];
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller"
                                                                      message:@"自动滚动已自动停止"
