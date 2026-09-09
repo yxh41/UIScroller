@@ -36,6 +36,7 @@ static const void *kTapGestureKey       = &kTapGestureKey;
 static const void *kMenuAddedKey        = &kMenuAddedKey;
 static const void *kVerticalDownKey     = &kVerticalDownKey;
 static const void *kDragVelocityKey     = &kDragVelocityKey;
+static const void *kScrollStartKey      = &kScrollStartKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -50,6 +51,14 @@ static NSString *speedName(int type) {
         default: return @"慢速"; // 0
     }
 }
+
+// 自动档（跟随滑动力道）参数：恒定速度 = 松手甩动速度 * kAutoSpeedFactor，钳制 [min, max] pt/s
+static const float kAutoSpeedFactor     = 0.12f;
+static const float kAutoSpeedMin        = 40.0f;
+static const float kAutoSpeedMax        = 400.0f;
+// 起步缓入时长（秒）：这段时间内速度从 0 平滑升到目标值，
+// 正好与 iOS 自带的甩动减速此消彼长，衔接才不会顿挫。
+static const CFTimeInterval kAutoSpeedRamp = 0.45;
 
 // per-app 禁用 key（原版用全局 key，UI 写 "Disable for this app" 但实际禁用所有 app）
 static NSString *disabledKey() {
@@ -215,28 +224,32 @@ void openSimpleMenu() {
         }
     }
 
+    // 这里不再启动自动滚动：拖拽刚开始时 pan 速度接近 0（拿不到真实力道），
+    // 而且此时启动会和用户正在进行的拖拽叠加，导致跟手发飘。
+    // 改为在 _scrollViewWillEndDraggingWithDeceleration: 松手时接管。
     - (void)_scrollViewWillBeginDragging {
         %orig;
-
-        CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
-
-        BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
-        if (!isDisabled) {
-            if (fabs(velocity.y) > fabs(velocity.x)) {
-                // velocity.y > 0 表示手指向下滑 -> 继续向下滚 -> verticalDown = NO（保持原语义）
-                BOOL vDown = (velocity.y <= 0);
-                objc_setAssociatedObject(self, kVerticalDownKey, @(vDown), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                // 记录松手瞬间的力道（pt/s），供"自动"速度档使用
-                objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(velocity.y)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                [self startUIScroller];
-            }
-        }
     }
 
     // 原版这里把 %orig 调了两次（第一次 if 里、第二次 return 里），原实现副作用会执行两次。改为只调一次。
     - (BOOL)_scrollViewWillEndDraggingWithDeceleration:(BOOL)arg1 {
         BOOL r = %orig;
-        if (!r && !arg1) [self stopUIScroller];
+        if (!r && !arg1) {
+            // 松手后不会有惯性减速（慢慢拖停）-> 不接管
+            [self stopUIScroller];
+            return r;
+        }
+
+        BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
+        CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
+        if (!isDisabled && fabs(velocity.y) > fabs(velocity.x)) {
+            // velocity.y > 0 表示手指向下滑 -> 继续向下滚 -> verticalDown = NO（保持原语义）
+            BOOL vDown = (velocity.y <= 0);
+            objc_setAssociatedObject(self, kVerticalDownKey, @(vDown), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // 松手瞬间的速度才是"甩动力度"，用它决定自动滚动的恒定速度
+            objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(velocity.y)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [self startUIScroller];
+        }
         return r;
     }
 
@@ -277,6 +290,8 @@ void openSimpleMenu() {
     %new
     - (void)startUIScroller {
         [self stopUIScroller];
+        // 记录起步时刻，用于速度缓入（与 iOS 自带减速惯性平滑交叠）
+        objc_setAssociatedObject(self, kScrollStartKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         __weak typeof(self) weakSelf = self;
         // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
@@ -321,29 +336,36 @@ void openSimpleMenu() {
 
     %new
     - (void)autoScroll {
-        float scrollSpeed = 1.0;
         CGPoint offset = self.contentOffset;
 
+        // 恒定速度（pt/s）
+        float pps = 100.0f;
         if (scrollSpeedType == 4) {
-            // 自动档：按滑动力道（松手瞬间竖直速度，pt/s）决定速度。
-            // 参考点 1200pt/s ≈ 原"标准"档（100pt/s），钳制在 0.3x~4x（30~400 pt/s）。
+            // 自动档：按松手瞬间的甩动速度决定恒定速度，钳制在 [40, 400] pt/s
             CGFloat v = [objc_getAssociatedObject(self, kDragVelocityKey) doubleValue];
-            scrollSpeed = (float)(v / 1200.0);
-            if (scrollSpeed < 0.3f) scrollSpeed = 0.3f;
-            if (scrollSpeed > 4.0f) scrollSpeed = 4.0f;
+            pps = (float)(v * kAutoSpeedFactor);
+            if (pps < kAutoSpeedMin) pps = kAutoSpeedMin;
+            if (pps > kAutoSpeedMax) pps = kAutoSpeedMax;
         }
-        else if (scrollSpeedType == 0) scrollSpeed = 0.5;
-        else if (scrollSpeedType == 1) scrollSpeed = 1.0;
-        else if (scrollSpeedType == 2) scrollSpeed = 1.5;
-        else if (scrollSpeedType == 3) scrollSpeed = 2.0;
+        else if (scrollSpeedType == 0) pps = 50.0f;
+        else if (scrollSpeedType == 1) pps = 100.0f;
+        else if (scrollSpeedType == 2) pps = 150.0f;
+        else if (scrollSpeedType == 3) pps = 200.0f;
 
         BOOL vDown = [objc_getAssociatedObject(self, kVerticalDownKey) boolValue];
 
-        // 归一化到原 0.01s/100Hz 基准：不同刷新率下观感速度一致
-        // （60Hz 每帧多走、120Hz 每帧少走，单位时间位移不变）。
+        // 起步缓入：速度从 0 平滑升到目标值。这段时间正好和 iOS 自带的甩动减速叠加，
+        // 两者此消彼长，看上去就是"惯性自然收敛成定速"，不会有硬切的顿挫感。
+        CFTimeInterval started = [objc_getAssociatedObject(self, kScrollStartKey) doubleValue];
+        float ramp = (float)((CACurrentMediaTime() - started) / kAutoSpeedRamp);
+        if (ramp < 0.0f) ramp = 0.0f;
+        if (ramp > 1.0f) ramp = 1.0f;
+        ramp = ramp * ramp * (3.0f - 2.0f * ramp); // smoothstep
+
+        // 本帧位移 = 速度 × 帧时长（跟随 60/120Hz，单位时间位移一致）
         CADisplayLink *link = objc_getAssociatedObject(self, kScrollTimerKey);
         NSTimeInterval frameDur = (link && link.duration > 0) ? link.duration : (1.0/60.0);
-        float delta = scrollSpeed * (float)(frameDur / 0.01);
+        float delta = pps * (float)frameDur * ramp;
 
         if (vDown) offset.y += delta;
         else offset.y -= delta;
