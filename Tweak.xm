@@ -74,6 +74,9 @@ static const CFTimeInterval kBrakeDuration = 0.35;
 // 接管阈值：松手速度达到该值(pt/s)才进入自动滚动；低于它不接管，留给用户自然手动滑。
 // 没有它的话每一次甩动都会被劫持，用户就没法连续快速地手动滑了。
 static const float kAutoTriggerVelocity = 700.0f;
+// "按住即停"需要按住的时长（秒）：设成 0 会让连续快速甩动时每一次触屏都触发刹车，
+// 干扰手动滑。0.25s 足以过滤掉甩动（甩动从触屏到抬手一般 <0.15s），又不会觉得迟钝。
+static const NSTimeInterval kStopTouchDuration = 0.25;
 // 接管还要求内容真的够滚（可滚距离下限 pt）：像微信下拉小程序面板这种一屏放得下的视图，
 // 没有可滚的距离，接管只会打断它自己的回弹/动画，看起来就是卡住
 static const float kMinScrollableTravel = 120.0f;
@@ -321,10 +324,11 @@ void openSimpleMenu() {
         // UIDatePicker / UIPickerView 滚轮也不挂
         if (scrollViewInsidePicker(self)) return;
 
-        // 用 minimumPressDuration = 0 的长按手势：手指一落下就进入 Began，
-        // 不需要等一次完整 tap（原来的 tap 手势要抬手才算，手指稍微一动就识别失败）。
+        // 用长按手势做"按住即停"：按时长 kStopTouchDuration 秒。
+        // 之前设 0（一碰就停），结果连续快速甩动时每次触屏都触发刹车，起手就打架；
+        // 延长后，甩动（触屏到抬手 <0.15s）根本到不了 Began，完全不干扰手动滑。
         UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleStopTouch:)];
-        press.minimumPressDuration = 0.0;
+        press.minimumPressDuration = kStopTouchDuration;
         press.numberOfTouchesRequired = 1;
         press.cancelsTouchesInView = NO;
         press.delaysTouchesBegan = NO;
