@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <math.h>
 
 @interface UIScrollView (UIScroller)
 @property (nonatomic,readonly) UIPanGestureRecognizer *panGestureRecognizer;
@@ -37,6 +38,8 @@ static const void *kMenuAddedKey        = &kMenuAddedKey;
 static const void *kVerticalDownKey     = &kVerticalDownKey;
 static const void *kDragVelocityKey     = &kDragVelocityKey;
 static const void *kScrollStartKey      = &kScrollStartKey;
+static const void *kScrollBaseOffsetKey = &kScrollBaseOffsetKey;
+static const void *kScrollTravelKey     = &kScrollTravelKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -52,13 +55,14 @@ static NSString *speedName(int type) {
     }
 }
 
-// 自动档（跟随滑动力道）参数：恒定速度 = 松手甩动速度 * kAutoSpeedFactor，钳制 [min, max] pt/s
+// 自动档（跟随滑动力道）：稳态速度 = 松手甩动速度 × kAutoSpeedFactor，钳制 [min, max] pt/s。
+// 这是一条纯连续曲线，与下面的固定挡位（50/100/150/200）完全无关，不做任何挡位量化。
 static const float kAutoSpeedFactor     = 0.12f;
 static const float kAutoSpeedMin        = 40.0f;
 static const float kAutoSpeedMax        = 400.0f;
-// 起步缓入时长（秒）：这段时间内速度从 0 平滑升到目标值，
-// 正好与 iOS 自带的甩动减速此消彼长，衔接才不会顿挫。
-static const CFTimeInterval kAutoSpeedRamp = 0.45;
+// 惯性收敛时间常数（秒）：接管瞬间速度 = 松手速度 V，随后按 e^(-t/tau) 平滑收敛到稳态速度。
+// 取 ~0.45s 与 iOS 自带减速的衰减尺度接近，看上去就是"惯性自然延续"，不会顿一下。
+static const CFTimeInterval kAutoEaseTau = 0.45;
 
 // per-app 禁用 key（原版用全局 key，UI 写 "Disable for this app" 但实际禁用所有 app）
 static NSString *disabledKey() {
@@ -290,8 +294,11 @@ void openSimpleMenu() {
     %new
     - (void)startUIScroller {
         [self stopUIScroller];
-        // 记录起步时刻，用于速度缓入（与 iOS 自带减速惯性平滑交叠）
+        // 接管瞬间的基准位置 / 时刻 / 累计位移：之后按我们自己的曲线绝对定位，
+        // 不再基于 self.contentOffset 做累加，避免和 iOS 自带减速互相打断造成顿挫。
         objc_setAssociatedObject(self, kScrollStartKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         __weak typeof(self) weakSelf = self;
         // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
@@ -336,50 +343,52 @@ void openSimpleMenu() {
 
     %new
     - (void)autoScroll {
-        CGPoint offset = self.contentOffset;
+        CGFloat v0 = [objc_getAssociatedObject(self, kDragVelocityKey) doubleValue]; // 松手瞬时速度 pt/s
 
-        // 恒定速度（pt/s）
-        float pps = 100.0f;
+        // 稳态速度（pt/s）
+        float steady = 100.0f;
         if (scrollSpeedType == 4) {
-            // 自动档：按松手瞬间的甩动速度决定恒定速度，钳制在 [40, 400] pt/s
-            CGFloat v = [objc_getAssociatedObject(self, kDragVelocityKey) doubleValue];
-            pps = (float)(v * kAutoSpeedFactor);
-            if (pps < kAutoSpeedMin) pps = kAutoSpeedMin;
-            if (pps > kAutoSpeedMax) pps = kAutoSpeedMax;
+            // 自动档：纯连续函数，只看松手力度，不参考任何固定挡位
+            steady = (float)(v0 * kAutoSpeedFactor);
+            if (steady < kAutoSpeedMin) steady = kAutoSpeedMin;
+            if (steady > kAutoSpeedMax) steady = kAutoSpeedMax;
         }
-        else if (scrollSpeedType == 0) pps = 50.0f;
-        else if (scrollSpeedType == 1) pps = 100.0f;
-        else if (scrollSpeedType == 2) pps = 150.0f;
-        else if (scrollSpeedType == 3) pps = 200.0f;
+        else if (scrollSpeedType == 0) steady = 50.0f;
+        else if (scrollSpeedType == 1) steady = 100.0f;
+        else if (scrollSpeedType == 2) steady = 150.0f;
+        else if (scrollSpeedType == 3) steady = 200.0f;
 
-        BOOL vDown = [objc_getAssociatedObject(self, kVerticalDownKey) boolValue];
-
-        // 起步缓入：速度从 0 平滑升到目标值。这段时间正好和 iOS 自带的甩动减速叠加，
-        // 两者此消彼长，看上去就是"惯性自然收敛成定速"，不会有硬切的顿挫感。
+        // 自定义惯性：接管瞬间速度 = 松手速度 v0，之后按 e^(-t/tau) 平滑收敛到稳态速度。
+        // 衰减尺度和 iOS 自带减速接近，所以是"惯性自然延续成定速"，不会先顿一下再起步。
         CFTimeInterval started = [objc_getAssociatedObject(self, kScrollStartKey) doubleValue];
-        float ramp = (float)((CACurrentMediaTime() - started) / kAutoSpeedRamp);
-        if (ramp < 0.0f) ramp = 0.0f;
-        if (ramp > 1.0f) ramp = 1.0f;
-        ramp = ramp * ramp * (3.0f - 2.0f * ramp); // smoothstep
+        CFTimeInterval t = CACurrentMediaTime() - started;
+        // 不要夹到 steady：轻扫时（v0 < steady）需要让它从 v0 平滑"升"到 steady，
+        // 强行取 steady 反而会突跳一下。
+        float speed = steady + (float)((v0 - steady) * exp(-t / kAutoEaseTau));
+        if (speed < 0.0f) speed = 0.0f;
 
-        // 本帧位移 = 速度 × 帧时长（跟随 60/120Hz，单位时间位移一致）
+        // 位移由我们自己累计并绝对定位，不基于 self.contentOffset 累加，
+        // 避免与 iOS 减速相互打断而产生抖动。
         CADisplayLink *link = objc_getAssociatedObject(self, kScrollTimerKey);
         NSTimeInterval frameDur = (link && link.duration > 0) ? link.duration : (1.0/60.0);
-        float delta = pps * (float)frameDur * ramp;
+        double travel = [objc_getAssociatedObject(self, kScrollTravelKey) doubleValue] + (double)speed * frameDur;
+        objc_setAssociatedObject(self, kScrollTravelKey, @(travel), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
-        if (vDown) offset.y += delta;
-        else offset.y -= delta;
+        double base = [objc_getAssociatedObject(self, kScrollBaseOffsetKey) doubleValue];
+        BOOL vDown = [objc_getAssociatedObject(self, kVerticalDownKey) boolValue];
+        CGFloat targetY = (CGFloat)(vDown ? (base + travel) : (base - travel));
 
-        // 越界判断：考虑 adjustedContentInset（iOS 11+ 安全区/导航栏/底部 home 指示条），
-        // 否则在带 inset 的 scroll view 上会提前停或越界一点。
+        // 越界判断：考虑 adjustedContentInset（iOS 11+ 安全区/导航栏/底部 home 指示条）
         UIEdgeInsets insets = self.adjustedContentInset;
         CGFloat minOffset = -insets.top;
         CGFloat maxOffset = MAX(minOffset, self.contentSize.height + insets.bottom - CGRectGetHeight(self.bounds));
-        if ((vDown && offset.y >= maxOffset) || (!vDown && offset.y <= minOffset)) {
+        if (targetY >= maxOffset || targetY <= minOffset) {
             [self stopUIScroller];
             return;
         }
 
+        CGPoint offset = self.contentOffset;
+        offset.y = targetY;
         [self setContentOffset:offset animated:NO];
     }
 
