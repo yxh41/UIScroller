@@ -296,11 +296,14 @@ void openSimpleMenu() {
     - (BOOL)_scrollViewWillEndDraggingWithDeceleration:(BOOL)arg1 {
         BOOL r = %orig;
 
-        // ── 自动档：惯性延续（照搬 pxcex AutoScroll 的触发模型）──
-        // 只有"按下瞬间内容还在滚"的触摸才有资格接续；v0 取按下瞬间速度与松手速度中较大者
-        //（点击接续 → 用按下瞬间速度；拖甩接续 → 用松手速度）。
+        // ── 自动档：惯性延续（对齐 pxcex AutoScroll 的手感）──
+        // 运动模型：接管后速度按 v0·e^(-t/tau) 纯衰减滑到停，没有稳态巡航段。
+        // 触发条件（满足其一即接管）：
+        //   A. 单次甩动自动延续：松手速度够大（主要用法：滑一下松手，它自己接着滚）
+        //   B. 惯性接续：按下瞬间内容还在滚（滚动中再触摸/点击 = 想让它继续），
+        //      且这次触摸不是刚"按住即停"过的。
         if (scrollSpeedType == 4) {
-            // 按 App 禁用：禁用状态下的自动档不做任何接续
+            // 按 App 禁用：禁用状态下的自动档不接管
             if ([[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()]) {
                 [self stopUIScroller];
                 return r;
@@ -308,12 +311,15 @@ void openSimpleMenu() {
             double bv = [objc_getAssociatedObject(self, kBeginVelocityKey) doubleValue];
             BOOL stopByTouch = [objc_getAssociatedObject(self, kStopByTouchKey) boolValue];
             objc_setAssociatedObject(self, kStopByTouchKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            // 按下瞬间内容没在滚（从静止起手的拖动）或用户刚"按住即停"过 → 一律不接续
-            if (bv < kAutoChainTrigger || stopByTouch) {
+            CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
+            BOOL strongEnough = fabs(velocity.y) >= kAutoTriggerVelocity && fabs(velocity.y) > fabs(velocity.x);
+            BOOL chain = (bv >= kAutoChainTrigger) && !stopByTouch;
+            if (!strongEnough && !chain) {
+                // 两种触发都不满足：留给系统自然减速
                 [self stopUIScroller];
                 return r;
             }
-            CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
+            // v0 取松手速度与按下瞬间速度中较大者（单次甩动 → 松手速度；点击接续 → 按下速度）
             CGFloat vSrc = (fabs(velocity.y) > bv) ? velocity.y : (CGFloat)bv;
             if (fabs(vSrc) < kAutoChainTrigger) {
                 [self stopUIScroller];
