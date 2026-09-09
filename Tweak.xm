@@ -55,7 +55,7 @@ static NSString *speedName(int type) {
         case 1:  return @"标准";
         case 2:  return @"较快";
         case 3:  return @"快速";
-        case 4:  return @"自动（惯性延续）";
+        case 4:  return @"自动（跟随滑动力道）";
         default: return @"慢速"; // 0
     }
 }
@@ -64,12 +64,9 @@ static NSString *speedName(int type) {
 // 接管瞬间速度 = 松手速度 V，随后按 e^(-t/tau) 平滑收敛到稳态速度。
 // 取 ~0.45s 与 iOS 自带减速的衰减尺度接近，看上去就是"惯性自然延续"，不会顿一下。
 static const CFTimeInterval kAutoEaseTau = 0.45;
-// ── 自动档（松手即自动滚，速度跟随力道）──
-// 滑行衰减时间常数（秒）：接续后速度按 v0·e^(-t/tau) 纯衰减，没有稳态巡航段。
-// 2.0s = 甩 2000pt/s 大约还能滑 4000pt；嫌滑太远调小、太近调大。
-static const CFTimeInterval kAutoGlideTau = 2.0;
-// 停止阈值（pt/s）：衰减到该速度以下直接结束驱动（人眼已察觉不到在动）。
-static const float kAutoGlideStopSpeed = 10.0f;
+// ── 自动档（松手即自动滚，速度跟随力道，一直滚到用户手动停）──
+// 巡航速度上限（pt/s）：巡航速度 = 松手甩动速度，超过该值钳制（甩太狠也不会快到看不清）。
+static const float kAutoCruiseMax = 800.0f;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
@@ -482,10 +479,11 @@ void openSimpleMenu() {
 
         float speed;
         if (scrollSpeedType == 4) {
-            // 自动档（惯性延续，照搬 pxcex）：没有稳态巡航段，速度按 e^(-t/tau) 纯衰减，
-            // 就是"把这次甩动的力道延续下去"，自然滑到停，不存在定速巡航也不会顿。
-            speed = (float)(v0 * exp(-t / kAutoGlideTau));
-            if (speed < kAutoGlideStopSpeed) { [self stopUIScroller]; return; }
+            // 自动档：匀速巡航，速度 = 松手甩动速度（跟随力道），一直滚到用户手动停 / 滚到内容尽头。
+            // 按住 0.25s 走刹车段；轻触屏幕会立即交还控制权（beginDragging 停驱动）。
+            speed = (float)v0;
+            if (speed > kAutoCruiseMax) speed = kAutoCruiseMax;
+            if (speed < kAutoTriggerAuto) speed = kAutoTriggerAuto;
         } else {
             // 固定挡：稳态速度（pt/s）
             float steady = 100.0f;
