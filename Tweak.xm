@@ -9,11 +9,11 @@
 - (void)stopUIScroller;
 - (void)brakeUIScroller;
 - (void)autoScroll;
-- (void)handleTaps:(UITapGestureRecognizer *)gesture;
+- (void)handleStopTouch:(UILongPressGestureRecognizer *)gesture;
 - (void)stopAutoDisableTimer;
 - (void)autoDisableScrolling;
-- (void)attachStopTapGesture;
-- (void)detachStopTapGesture;
+- (void)attachStopTouchGesture;
+- (void)detachStopTouchGesture;
 @end
 
 // CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
@@ -34,13 +34,14 @@
 //   3) didMoveToWindow 反复 addGestureRecognizer 造成手势累积
 static const void *kScrollTimerKey      = &kScrollTimerKey;
 static const void *kAutoDisableTimerKey = &kAutoDisableTimerKey;
-static const void *kTapGestureKey       = &kTapGestureKey;
+static const void *kStopGestureKey       = &kStopGestureKey;
 static const void *kMenuAddedKey        = &kMenuAddedKey;
 static const void *kVerticalDownKey     = &kVerticalDownKey;
 static const void *kDragVelocityKey     = &kDragVelocityKey;
 static const void *kScrollStartKey      = &kScrollStartKey;
 static const void *kScrollBaseOffsetKey = &kScrollBaseOffsetKey;
 static const void *kScrollTravelKey     = &kScrollTravelKey;
+static const void *kLastTickKey         = &kLastTickKey;
 static const void *kBrakingKey          = &kBrakingKey;
 static const void *kBrakeStartKey       = &kBrakeStartKey;
 
@@ -245,7 +246,7 @@ void openSimpleMenu() {
         // 之前 isDisabled 只在 _scrollViewWillBeginDragging 里拦"是否启动滚动"，
         // 手势照挂不误 —— 这就是"设置里禁用了，输入框依然点不动"的原因。
         if ([[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()]) {
-            [self detachStopTapGesture];
+            [self detachStopTouchGesture];
             return;
         }
     }
@@ -281,39 +282,44 @@ void openSimpleMenu() {
         return r;
     }
 
-    // 只在"自动滚动进行中"挂 tap 手势（用于点一下停）。平时不挂，
+    // 只在"自动滚动进行中"挂停止手势（碰到就停）。平时不挂，
     // 避免在绝大多数非滚动场景下干扰 App 自身的点击（尤其是输入框）。
     %new
-    - (void)attachStopTapGesture {
-        if (objc_getAssociatedObject(self, kTapGestureKey)) return;
+    - (void)attachStopTouchGesture {
+        if (objc_getAssociatedObject(self, kStopGestureKey)) return;
         if ([[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()]) return;
-        // UITextView 本身就是 UIScrollView 子类，额外 tap 会和它内部文本交互手势冲突 -> 点了没反应
+        // UITextView 本身就是 UIScrollView 子类，额外手势会和它内部文本交互手势冲突 -> 点了没反应
         if ([self isKindOfClass:[UITextView class]]) return;
-        // WKWebView 内部的 WKScrollView 挂 tap 会让网页输入框点不动
+        // WKWebView 内部的 WKScrollView 挂手势会让网页输入框点不动
         if (scrollViewInsideWebView(self)) return;
-        // UIDatePicker / UIPickerView 滚轮也不挂 tap
+        // UIDatePicker / UIPickerView 滚轮也不挂
         if (scrollViewInsidePicker(self)) return;
 
-        UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTaps:)];
-        tap.numberOfTapsRequired = 1;
-        tap.cancelsTouchesInView = NO;
-        tap.delaysTouchesBegan = NO;
-        tap.delaysTouchesEnded = NO; // 关键：不延迟 touchesEnded，否则点击输入框会卡住/没反应
-        [self addGestureRecognizer:tap];
-        objc_setAssociatedObject(self, kTapGestureKey, tap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 用 minimumPressDuration = 0 的长按手势：手指一落下就进入 Began，
+        // 不需要等一次完整 tap（原来的 tap 手势要抬手才算，手指稍微一动就识别失败）。
+        UILongPressGestureRecognizer *press = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleStopTouch:)];
+        press.minimumPressDuration = 0.0;
+        press.numberOfTouchesRequired = 1;
+        press.cancelsTouchesInView = NO;
+        press.delaysTouchesBegan = NO;
+        press.delaysTouchesEnded = NO;
+        [self addGestureRecognizer:press];
+        objc_setAssociatedObject(self, kStopGestureKey, press, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
     %new
-    - (void)detachStopTapGesture {
-        UITapGestureRecognizer *tap = objc_getAssociatedObject(self, kTapGestureKey);
-        if (tap) {
-            [self removeGestureRecognizer:tap];
-            objc_setAssociatedObject(self, kTapGestureKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    - (void)detachStopTouchGesture {
+        UILongPressGestureRecognizer *press = objc_getAssociatedObject(self, kStopGestureKey);
+        if (press) {
+            [self removeGestureRecognizer:press];
+            objc_setAssociatedObject(self, kStopGestureKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
 
     %new
-    - (void)handleTaps:(UITapGestureRecognizer *)gesture {
+    - (void)handleStopTouch:(UILongPressGestureRecognizer *)gesture {
+        // 长按手势每个状态变化都会回调，只取"手指刚落下"这一刻
+        if (gesture.state != UIGestureRecognizerStateBegan) return;
         [self brakeUIScroller];
     }
 
@@ -325,6 +331,7 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kScrollStartKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kLastTickKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 首帧用默认 1/60s
 
         __weak typeof(self) weakSelf = self;
         // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
@@ -336,7 +343,7 @@ void openSimpleMenu() {
         [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
         objc_setAssociatedObject(self, kScrollTimerKey, link, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // 挂上"点一下停止"的手势（只在滚动期间存在）
-        [self attachStopTapGesture];
+        [self attachStopTouchGesture];
 
         if (autoDisableMinutes > 0) {
             [self stopAutoDisableTimer];
@@ -356,7 +363,7 @@ void openSimpleMenu() {
             objc_setAssociatedObject(self, kScrollTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         objc_setAssociatedObject(self, kBrakingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [self detachStopTapGesture];
+        [self detachStopTouchGesture];
     }
 
     // 用户主动停止时走这里：进入刹车态，速度匀减速滑到 0 再真正停。
@@ -416,8 +423,16 @@ void openSimpleMenu() {
         // 位移由我们自己累计并绝对定位，不基于 self.contentOffset 累加，
         // 避免与 iOS 减速相互打断而产生抖动。
         CADisplayLink *link = objc_getAssociatedObject(self, kScrollTimerKey);
-        NSTimeInterval frameDur = (link && link.duration > 0) ? link.duration : (1.0/60.0);
-        double travel = [objc_getAssociatedObject(self, kScrollTravelKey) doubleValue] + (double)speed * frameDur;
+        // 用"真实帧间隔"（相邻两次回调 timestamp 之差），而不是 link.duration 那个标称值：
+        // 掉帧或负载波动时，位移量依然与真实流逝时间成正比，速度观感才稳定，不会一顿一顿。
+        double prev = [objc_getAssociatedObject(self, kLastTickKey) doubleValue];
+        double now = link ? link.timestamp : CACurrentMediaTime();
+        double dt = (prev > 0.0) ? (now - prev) : (1.0 / 60.0);
+        if (dt < 0.0) dt = 0.0;
+        if (dt > 0.05) dt = 0.05; // 卡顿保护：长时间挂起后回到前台，避免一帧跳太远
+        objc_setAssociatedObject(self, kLastTickKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        double travel = [objc_getAssociatedObject(self, kScrollTravelKey) doubleValue] + (double)speed * dt;
         objc_setAssociatedObject(self, kScrollTravelKey, @(travel), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         double base = [objc_getAssociatedObject(self, kScrollBaseOffsetKey) doubleValue];
@@ -453,7 +468,12 @@ void openSimpleMenu() {
 %end
 
 %ctor {
-    // Only run on user installed apps
+    // 用户 App（/var/containers/Bundle/Application）+ 系统 App（/Applications/，如照片、Safari、设置）。
+    // 守护进程在 /usr/libexec、/System/Library 下，SpringBoard 在 /System/Library/CoreServices，
+    // 都不匹配，所以不会被注入（系统 App 里出问题可在菜单里"禁用此应用"）。
     NSString *executablePath = NSProcessInfo.processInfo.arguments[0];
-    if ([executablePath containsString:@"/var/containers/Bundle/Application"]) %init;
+    if ([executablePath containsString:@"/var/containers/Bundle/Application"] ||
+        [executablePath containsString:@"/Applications/"]) {
+        %init;
+    }
 }
