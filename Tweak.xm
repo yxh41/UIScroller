@@ -35,9 +35,21 @@ static const void *kAutoDisableTimerKey = &kAutoDisableTimerKey;
 static const void *kTapGestureKey       = &kTapGestureKey;
 static const void *kMenuAddedKey        = &kMenuAddedKey;
 static const void *kVerticalDownKey     = &kVerticalDownKey;
+static const void *kDragVelocityKey     = &kDragVelocityKey;
 
-int scrollSpeedType = 0;    // 0: Slow, 1: Normal, 2: Medium, 3: Fast
+int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
+
+// 速度档位名（菜单显示用）
+static NSString *speedName(int type) {
+    switch (type) {
+        case 1:  return @"标准";
+        case 2:  return @"较快";
+        case 3:  return @"快速";
+        case 4:  return @"自动（跟随滑动力道）";
+        default: return @"慢速"; // 0
+    }
+}
 
 // per-app 禁用 key（原版用全局 key，UI 写 "Disable for this app" 但实际禁用所有 app）
 static NSString *disabledKey() {
@@ -91,10 +103,10 @@ void openSimpleMenu() {
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller 快捷菜单"
                                         message:nil
                                         preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *speed = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"速度：%@", scrollSpeedType == 3 ? @"快速" : (scrollSpeedType == 2 ? @"较快" : (scrollSpeedType == 1 ? @"标准" : @"慢速"))] style:UIAlertActionStyleDefault
+        UIAlertAction *speed = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"速度：%@", speedName(scrollSpeedType)] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
-                                    if (scrollSpeedType == 3) scrollSpeedType = 0;
-                                    else scrollSpeedType += 1;
+                                    // 0 慢速 -> 1 标准 -> 2 较快 -> 3 快速 -> 4 自动 -> 回到 0
+                                    scrollSpeedType = (scrollSpeedType >= 4) ? 0 : scrollSpeedType + 1;
                                 }];
         UIAlertAction *autoDisable = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"自动停止：%@", autoDisableMinutes == 0 ? @"关闭" : [NSString stringWithFormat:@"%d 分钟", autoDisableMinutes]] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
@@ -196,6 +208,8 @@ void openSimpleMenu() {
                 // velocity.y > 0 表示手指向下滑 -> 继续向下滚 -> verticalDown = NO（保持原语义）
                 BOOL vDown = (velocity.y <= 0);
                 objc_setAssociatedObject(self, kVerticalDownKey, @(vDown), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                // 记录松手瞬间的力道（pt/s），供"自动"速度档使用
+                objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(velocity.y)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 [self startUIScroller];
             }
         }
@@ -292,7 +306,15 @@ void openSimpleMenu() {
         float scrollSpeed = 1.0;
         CGPoint offset = self.contentOffset;
 
-        if (scrollSpeedType == 0) scrollSpeed = 0.5;
+        if (scrollSpeedType == 4) {
+            // 自动档：按滑动力道（松手瞬间竖直速度，pt/s）决定速度。
+            // 参考点 1200pt/s ≈ 原"标准"档（100pt/s），钳制在 0.3x~4x（30~400 pt/s）。
+            CGFloat v = [objc_getAssociatedObject(self, kDragVelocityKey) doubleValue];
+            scrollSpeed = (float)(v / 1200.0);
+            if (scrollSpeed < 0.3f) scrollSpeed = 0.3f;
+            if (scrollSpeed > 4.0f) scrollSpeed = 4.0f;
+        }
+        else if (scrollSpeedType == 0) scrollSpeed = 0.5;
         else if (scrollSpeedType == 1) scrollSpeed = 1.0;
         else if (scrollSpeedType == 2) scrollSpeed = 1.5;
         else if (scrollSpeedType == 3) scrollSpeed = 2.0;
