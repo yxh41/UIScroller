@@ -14,6 +14,7 @@
 - (void)autoDisableScrolling;
 - (void)attachStopTouchGesture;
 - (void)detachStopTouchGesture;
+- (double)uiscrollerInternalVelocity;
 @end
 
 // CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
@@ -63,14 +64,19 @@ static NSString *speedName(int type) {
     }
 }
 
-// 自动档（跟随滑动力道）：稳态速度 = 松手甩动速度 × kAutoSpeedFactor，钳制 [min, max] pt/s。
-// 这是一条纯连续曲线，与下面的固定挡位（50/100/150/200）完全无关，不做任何挡位量化。
-static const float kAutoSpeedFactor     = 0.12f;
-static const float kAutoSpeedMin        = 40.0f;
-static const float kAutoSpeedMax        = 400.0f;
-// 惯性收敛时间常数（秒）：接管瞬间速度 = 松手速度 V，随后按 e^(-t/tau) 平滑收敛到稳态速度。
+// ── 固定挡（慢速/标准/较快/快速）：惯性收敛时间常数（秒）──
+// 接管瞬间速度 = 松手速度 V，随后按 e^(-t/tau) 平滑收敛到稳态速度。
 // 取 ~0.45s 与 iOS 自带减速的衰减尺度接近，看上去就是"惯性自然延续"，不会顿一下。
 static const CFTimeInterval kAutoEaseTau = 0.45;
+// ── 自动档（惯性延续，照搬 pxcex AutoScroll）──
+// 接续阈值（pt/s）：按下瞬间内容滚动速度达到该值才视为"惯性接续"。
+// 从静止起手的拖动（微信下拉面板/滚轮）按下瞬间速度≈0，天然不满足，不会被接管。
+static const float kAutoChainTrigger = 250.0f;
+// 滑行衰减时间常数（秒）：接续后速度按 v0·e^(-t/tau) 纯衰减，没有稳态巡航段。
+// 2.0s = 甩 2000pt/s 大约还能滑 4000pt；嫌滑太远调小、太近调大。
+static const CFTimeInterval kAutoGlideTau = 2.0;
+// 停止阈值（pt/s）：衰减到该速度以下直接结束驱动（人眼已察觉不到在动）。
+static const float kAutoGlideStopSpeed = 10.0f;
 // 刹车时长（秒）：停止时做匀减速（像摩擦制动）滑到 0，而不是瞬间定住。
 // 0.35s 既刹得住又不会显得生硬；想要更干脆就调小。
 static const CFTimeInterval kBrakeDuration = 0.35;
