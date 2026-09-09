@@ -14,7 +14,6 @@
 - (void)autoDisableScrolling;
 - (void)attachStopTouchGesture;
 - (void)detachStopTouchGesture;
-- (double)uiscrollerInternalVelocity;
 @end
 
 // CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
@@ -46,9 +45,6 @@ static const void *kLastTickKey         = &kLastTickKey;
 static const void *kBrakingKey          = &kBrakingKey;
 static const void *kBrakeStartKey       = &kBrakeStartKey;
 static const void *kTouchStartKey       = &kTouchStartKey;
-static const void *kBeginVelocityKey    = &kBeginVelocityKey;
-static const void *kStopByTouchKey      = &kStopByTouchKey;
-static const void *kCurSpeedKey         = &kCurSpeedKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -68,10 +64,7 @@ static NSString *speedName(int type) {
 // 接管瞬间速度 = 松手速度 V，随后按 e^(-t/tau) 平滑收敛到稳态速度。
 // 取 ~0.45s 与 iOS 自带减速的衰减尺度接近，看上去就是"惯性自然延续"，不会顿一下。
 static const CFTimeInterval kAutoEaseTau = 0.45;
-// ── 自动档（惯性延续，照搬 pxcex AutoScroll）──
-// 接续阈值（pt/s）：按下瞬间内容滚动速度达到该值才视为"惯性接续"。
-// 从静止起手的拖动（微信下拉面板/滚轮）按下瞬间速度≈0，天然不满足，不会被接管。
-static const float kAutoChainTrigger = 250.0f;
+// ── 自动档（松手即自动滚，速度跟随力道）──
 // 滑行衰减时间常数（秒）：接续后速度按 v0·e^(-t/tau) 纯衰减，没有稳态巡航段。
 // 2.0s = 甩 2000pt/s 大约还能滑 4000pt；嫌滑太远调小、太近调大。
 static const CFTimeInterval kAutoGlideTau = 2.0;
@@ -278,21 +271,6 @@ void openSimpleMenu() {
     // 否则我们每帧的绝对定位写入会把内容"锁死"，手指拖不动，就没法手动连续快速滑动。
     - (void)_scrollViewWillBeginDragging {
         %orig;
-        // 自动档（惯性延续）：记录"按下瞬间"的内容滚动速度。
-        // 只有按下那一刻内容还在动（甩动惯性/我们的驱动未停），松手后才有资格接续。
-        if (scrollSpeedType == 4) {
-            double chainV;
-            if (objc_getAssociatedObject(self, kScrollTimerKey)) {
-                // 我们自己的驱动还在跑：当前速度我们自己最清楚（autoScroll 每帧写入 kCurSpeedKey）
-                chainV = [objc_getAssociatedObject(self, kCurSpeedKey) doubleValue];
-            } else {
-                // 系统自带减速中：读私有速度（pxcex 同款方案），读不到退回手指速度
-                chainV = [self uiscrollerInternalVelocity];
-            }
-            objc_setAssociatedObject(self, kBeginVelocityKey, @(chainV), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-        // "按住即停"标记在每次新触摸按下时清除（这次触摸是否要停，由这次触摸自己决定）
-        objc_setAssociatedObject(self, kStopByTouchKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self stopUIScroller];
     }
 
@@ -300,36 +278,23 @@ void openSimpleMenu() {
     - (BOOL)_scrollViewWillEndDraggingWithDeceleration:(BOOL)arg1 {
         BOOL r = %orig;
 
-        // ── 自动档：惯性延续（对齐 pxcex AutoScroll 的手感）──
-        // 运动模型：接管后速度按 v0·e^(-t/tau) 纯衰减滑到停，没有稳态巡航段。
-        // 触发条件（满足其一即接管）：
-        //   A. 单次甩动自动延续：松手速度够大（主要用法：滑一下松手，它自己接着滚）
-        //   B. 惯性接续：按下瞬间内容还在滚（滚动中再触摸/点击 = 想让它继续），
-        //      且这次触摸不是刚"按住即停"过的。
+        // ── 自动档：松手即自动滚，速度完全跟随力道（甩得快滚得快、甩得慢滚得慢）──
+        // 接管后速度按 v0·e^(-t/tau) 纯衰减滑到停，没有稳态巡航段。
         if (scrollSpeedType == 4) {
             // 按 App 禁用：禁用状态下的自动档不接管
             if ([[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()]) {
                 [self stopUIScroller];
                 return r;
             }
-            double bv = [objc_getAssociatedObject(self, kBeginVelocityKey) doubleValue];
-            BOOL stopByTouch = [objc_getAssociatedObject(self, kStopByTouchKey) boolValue];
-            objc_setAssociatedObject(self, kStopByTouchKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
-            // 自动档触发阈值单独放低（300）：轻甩也延续，速度跟随力道；固定挡仍用 700
+            // 自动档触发阈值单独放低（300）：轻甩也延续；固定挡仍用 700
             BOOL strongEnough = fabs(velocity.y) >= kAutoTriggerAuto && fabs(velocity.y) > fabs(velocity.x);
-            BOOL chain = (bv >= kAutoChainTrigger) && !stopByTouch;
-            if (!strongEnough && !chain) {
-                // 两种触发都不满足：留给系统自然减速
+            if (!strongEnough) {
+                // 甩动力度不够：留给系统自然减速
                 [self stopUIScroller];
                 return r;
             }
-            // v0 取松手速度与按下瞬间速度中较大者（单次甩动 → 松手速度；点击接续 → 按下速度）
-            CGFloat vSrc = (fabs(velocity.y) > bv) ? velocity.y : (CGFloat)bv;
-            if (fabs(vSrc) < kAutoChainTrigger) {
-                [self stopUIScroller];
-                return r;
-            }
+            CGFloat vSrc = velocity.y;
             // 安全检查（与固定挡共用同一套）：
             //  - 滚轮（UIDatePicker/UIPickerView）不接
             //  - 内容不够滚的一屏视图（微信下拉小程序面板）不接
@@ -424,18 +389,6 @@ void openSimpleMenu() {
             [self removeGestureRecognizer:press];
             objc_setAssociatedObject(self, kStopGestureKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-    }
-
-    %new
-    // 读取 UIScrollView 私有的瞬时速度（pxcex AutoScroll 同款方案，_verticalVelocity）。
-    // 手指打断系统减速的瞬间没有公开 API 能拿到"当前惯性速度"，只能读私有 ivar；
-    // 读不到（Apple 改名/新版 iOS）就退回手指速度，功能退化但不崩溃。
-    - (double)uiscrollerInternalVelocity {
-        @try {
-            NSNumber *v = [self valueForKey:@"_verticalVelocity"];
-            if ([v isKindOfClass:[NSNumber class]]) return fabs([v doubleValue]);
-        } @catch (NSException *e) {}
-        return fabs([self.panGestureRecognizer velocityInView:self].y);
     }
 
     %new
@@ -547,8 +500,6 @@ void openSimpleMenu() {
             speed = steady + (float)((v0 - steady) * exp(-t / kAutoEaseTau));
             if (speed < 0.0f) speed = 0.0f;
         }
-        // 记录当前帧实际速度：自动档在"滚动中再次触摸"时要用它做惯性接续的初速度
-        objc_setAssociatedObject(self, kCurSpeedKey, @(speed), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         // 刹车：匀减速（线性降到 0），像摩擦制动一样滑停，而不是瞬间定住
         if ([objc_getAssociatedObject(self, kBrakingKey) boolValue]) {
