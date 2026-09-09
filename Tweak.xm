@@ -44,6 +44,7 @@ static const void *kScrollTravelKey     = &kScrollTravelKey;
 static const void *kLastTickKey         = &kLastTickKey;
 static const void *kBrakingKey          = &kBrakingKey;
 static const void *kBrakeStartKey       = &kBrakeStartKey;
+static const void *kTouchStartKey       = &kTouchStartKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -70,6 +71,9 @@ static const CFTimeInterval kAutoEaseTau = 0.45;
 // 刹车时长（秒）：停止时做匀减速（像摩擦制动）滑到 0，而不是瞬间定住。
 // 0.35s 既刹得住又不会显得生硬；想要更干脆就调小。
 static const CFTimeInterval kBrakeDuration = 0.35;
+// 接管阈值：松手速度达到该值(pt/s)才进入自动滚动；低于它不接管，留给用户自然手动滑。
+// 没有它的话每一次甩动都会被劫持，用户就没法连续快速地手动滑了。
+static const float kAutoTriggerVelocity = 700.0f;
 
 // per-app 禁用 key（原版用全局 key，UI 写 "Disable for this app" 但实际禁用所有 app）
 static NSString *disabledKey() {
@@ -251,11 +255,11 @@ void openSimpleMenu() {
         }
     }
 
-    // 这里不再启动自动滚动：拖拽刚开始时 pan 速度接近 0（拿不到真实力道），
-    // 而且此时启动会和用户正在进行的拖拽叠加，导致跟手发飘。
-    // 改为在 _scrollViewWillEndDraggingWithDeceleration: 松手时接管。
+    // 用户真正开始拖拽时：立刻结束我们的接管（含刹车中的）。
+    // 否则我们每帧的绝对定位写入会把内容"锁死"，手指拖不动，就没法手动连续快速滑动。
     - (void)_scrollViewWillBeginDragging {
         %orig;
+        [self stopUIScroller];
     }
 
     // 原版这里把 %orig 调了两次（第一次 if 里、第二次 return 里），原实现副作用会执行两次。改为只调一次。
@@ -269,15 +273,23 @@ void openSimpleMenu() {
 
         BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
         CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
+        BOOL vertical = fabs(velocity.y) > fabs(velocity.x);
+        // 只有"用力甩"才接管；轻中力度留给用户自然手动滑，否则没法连续快速滑动
+        BOOL strongEnough = fabs(velocity.y) >= kAutoTriggerVelocity;
         // 不要接管 UIDatePicker / UIPickerView 的滚轮：它们内部 scroll view 松手会减速到停，
         // 我们按惯性接管后滚轮会一直转，没法精确选时间
-        if (!isDisabled && fabs(velocity.y) > fabs(velocity.x) && !scrollViewInsidePicker(self)) {
+        BOOL shouldTakeOver = !isDisabled && vertical && strongEnough && !scrollViewInsidePicker(self);
+
+        if (shouldTakeOver) {
             // velocity.y > 0 表示手指向下滑 -> 继续向下滚 -> verticalDown = NO（保持原语义）
             BOOL vDown = (velocity.y <= 0);
             objc_setAssociatedObject(self, kVerticalDownKey, @(vDown), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             // 松手瞬间的速度才是"甩动力度"，用它决定自动滚动的恒定速度
             objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(velocity.y)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [self startUIScroller];
+        } else {
+            // 不接管：清掉可能残留的会话，让 iOS 自然减速
+            [self stopUIScroller];
         }
         return r;
     }
@@ -318,9 +330,21 @@ void openSimpleMenu() {
 
     %new
     - (void)handleStopTouch:(UILongPressGestureRecognizer *)gesture {
-        // 长按手势每个状态变化都会回调，只取"手指刚落下"这一刻
-        if (gesture.state != UIGestureRecognizerStateBegan) return;
-        [self brakeUIScroller];
+        if (gesture.state == UIGestureRecognizerStateBegan) {
+            // 记下落下位置，用于判断"是想停，还是想接着拖"
+            objc_setAssociatedObject(self, kTouchStartKey, [gesture locationInView:self], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [self brakeUIScroller];
+            return;
+        }
+        if (gesture.state == UIGestureRecognizerStateChanged) {
+            // 手指一动（>5pt）= 用户想手动拖 -> 立即交还控制权，不等拖拽判定
+            if (!objc_getAssociatedObject(self, kBrakingKey)) return;
+            CGPoint start = [objc_getAssociatedObject(self, kTouchStartKey) CGPointValue];
+            CGPoint loc = [gesture locationInView:self];
+            if (fabs(loc.x - start.x) > 5.0 || fabs(loc.y - start.y) > 5.0) {
+                [self stopUIScroller];
+            }
+        }
     }
 
     %new
