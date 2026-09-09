@@ -86,6 +86,22 @@ static BOOL scrollViewInsideWebView(UIScrollView *sv) {
     return NO;
 }
 
+// 判断 scroll view 是否在 UIDatePicker / UIPickerView 内部（接管后滚轮会一直转，无法选时间）
+static BOOL scrollViewInsidePicker(UIScrollView *sv) {
+    static Class dpClass = nil;
+    static Class pkClass = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dpClass = NSClassFromString(@"UIDatePicker");
+        pkClass = NSClassFromString(@"UIPickerView");
+    });
+    if (!dpClass && !pkClass) return NO;
+    for (UIView *v = sv.superview; v; v = v.superview) {
+        if ((dpClass && [v isKindOfClass:dpClass]) || (pkClass && [v isKindOfClass:pkClass])) return YES;
+    }
+    return NO;
+}
+
 id topViewController() {
     UIWindow *keyWindow = nil;
     NSArray *windows = [[UIApplication sharedApplication] windows];
@@ -246,7 +262,9 @@ void openSimpleMenu() {
 
         BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
         CGPoint velocity = [self.panGestureRecognizer velocityInView:self];
-        if (!isDisabled && fabs(velocity.y) > fabs(velocity.x)) {
+        // 不要接管 UIDatePicker / UIPickerView 的滚轮：它们内部 scroll view 松手会减速到停，
+        // 我们按惯性接管后滚轮会一直转，没法精确选时间
+        if (!isDisabled && fabs(velocity.y) > fabs(velocity.x) && !scrollViewInsidePicker(self)) {
             // velocity.y > 0 表示手指向下滑 -> 继续向下滚 -> verticalDown = NO（保持原语义）
             BOOL vDown = (velocity.y <= 0);
             objc_setAssociatedObject(self, kVerticalDownKey, @(vDown), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -267,6 +285,8 @@ void openSimpleMenu() {
         if ([self isKindOfClass:[UITextView class]]) return;
         // WKWebView 内部的 WKScrollView 挂 tap 会让网页输入框点不动
         if (scrollViewInsideWebView(self)) return;
+        // UIDatePicker / UIPickerView 滚轮也不挂 tap
+        if (scrollViewInsidePicker(self)) return;
 
         UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTaps:)];
         tap.numberOfTapsRequired = 1;
