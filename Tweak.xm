@@ -70,27 +70,27 @@ id topViewController() {
 void openSimpleMenu() {
     if (![topViewController() isKindOfClass:[UIAlertController class]]) {
         BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller Quick Menu"
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller 快捷菜单"
                                         message:nil
                                         preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *speed = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Speed: %@", scrollSpeedType == 3 ? @"Fast" : (scrollSpeedType == 2 ? @"Medium" : (scrollSpeedType == 1 ? @"Normal" : @"Slow"))] style:UIAlertActionStyleDefault
+        UIAlertAction *speed = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"速度：%@", scrollSpeedType == 3 ? @"快速" : (scrollSpeedType == 2 ? @"较快" : (scrollSpeedType == 1 ? @"标准" : @"慢速"))] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
                                     if (scrollSpeedType == 3) scrollSpeedType = 0;
                                     else scrollSpeedType += 1;
                                 }];
-        UIAlertAction *autoDisable = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Auto-disable: %@", autoDisableMinutes == 0 ? @"Off" : [NSString stringWithFormat:@"%d min", autoDisableMinutes]] style:UIAlertActionStyleDefault
+        UIAlertAction *autoDisable = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"自动停止：%@", autoDisableMinutes == 0 ? @"关闭" : [NSString stringWithFormat:@"%d 分钟", autoDisableMinutes]] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
-                                    UIAlertController *inputAlert = [UIAlertController alertControllerWithTitle:@"Set auto-disable Timer"
-                                                                                                      message:@"Enter minutes (0 to disable)"
+                                    UIAlertController *inputAlert = [UIAlertController alertControllerWithTitle:@"设置自动停止时间"
+                                                                                                      message:@"输入分钟数（0 表示关闭）"
                                                                                                preferredStyle:UIAlertControllerStyleAlert];
 
                                     [inputAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
                                         textField.keyboardType = UIKeyboardTypeNumberPad;
-                                        textField.placeholder = @"Minutes";
+                                        textField.placeholder = @"分钟";
                                         textField.text = [NSString stringWithFormat:@"%d", autoDisableMinutes];
                                     }];
 
-                                    UIAlertAction *confirmAction = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault
+                                    UIAlertAction *confirmAction = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault
                                         handler:^(UIAlertAction *action) {
                                             NSString *input = inputAlert.textFields.firstObject.text;
                                             int minutes = [input intValue];
@@ -98,26 +98,26 @@ void openSimpleMenu() {
                                             if (minutes > 180) minutes = 180;
                                             autoDisableMinutes = minutes;
                                             NSString *message = autoDisableMinutes == 0 ?
-                                                @"Auto-disable timer disabled" :
-                                                [NSString stringWithFormat:@"Auto-disable timer set to %d minutes", autoDisableMinutes];
-                                            UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:@"Timer Updated"
+                                                @"已关闭自动停止" :
+                                                [NSString stringWithFormat:@"自动停止时间已设为 %d 分钟", autoDisableMinutes];
+                                            UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:@"设置已更新"
                                                                                                                 message:message
                                                                                                          preferredStyle:UIAlertControllerStyleAlert];
-                                            [confirmation addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+                                            [confirmation addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
                                             [topViewController() presentViewController:confirmation animated:YES completion:nil];
                                         }];
 
-                                    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+                                    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
                                     [inputAlert addAction:confirmAction];
                                     [inputAlert addAction:cancelAction];
                                     [topViewController() presentViewController:inputAlert animated:YES completion:nil];
                                 }];
-        UIAlertAction *toggle = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@ for this app", isDisabled ? @"Enable" : @"Disable"] style:UIAlertActionStyleDefault
+        UIAlertAction *toggle = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@此应用", isDisabled ? @"启用" : @"禁用"] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
                                     if (isDisabled) [[NSUserDefaults standardUserDefaults] setBool:NO forKey:disabledKey()];
                                     else [[NSUserDefaults standardUserDefaults] setBool:YES forKey:disabledKey()];
                                 }];
-        UIAlertAction *dismiss = [UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil];
+        UIAlertAction *dismiss = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
         [alert addAction:speed];
         [alert addAction:autoDisable];
         [alert addAction:toggle];
@@ -276,9 +276,9 @@ void openSimpleMenu() {
         [self stopUIScroller];
         [self stopAutoDisableTimer];
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller"
-                                                                     message:@"Auto-scrolling has been automatically disabled"
+                                                                     message:@"自动滚动已自动停止"
                                                               preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *ok = [UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil];
+        UIAlertAction *ok = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil];
         [alert addAction:ok];
         [topViewController() presentViewController:alert animated:YES completion:nil];
     }
