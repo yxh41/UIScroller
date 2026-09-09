@@ -97,12 +97,22 @@ id topViewController() {
     else return rootController;
 }
 
+// 防重入：presentViewController 是异步的，展示动画完成前 topViewController() 还看不到这个 alert。
+// 此时若再次触发就会重复 present —— QQ 等 App 上表现为"点任何按钮菜单都重新弹出并卡住"。
+static BOOL menuBusy = NO;
+
 void openSimpleMenu() {
-    if (![topViewController() isKindOfClass:[UIAlertController class]]) {
-        BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller 快捷菜单"
-                                        message:nil
-                                        preferredStyle:UIAlertControllerStyleAlert];
+    if (menuBusy) return;
+    UIViewController *presenter = topViewController();
+    if (!presenter) return;
+    if ([presenter isKindOfClass:[UIAlertController class]]) return; // 菜单已在最上层
+    if (presenter.presentedViewController) return;                   // 正在展示别的弹窗
+
+    menuBusy = YES;
+    BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller 快捷菜单"
+                                    message:nil
+                                    preferredStyle:UIAlertControllerStyleAlert];
         UIAlertAction *speed = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"速度：%@", speedName(scrollSpeedType)] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
                                     // 0 慢速 -> 1 标准 -> 2 较快 -> 3 快速 -> 4 自动 -> 回到 0
@@ -152,8 +162,13 @@ void openSimpleMenu() {
         [alert addAction:autoDisable];
         [alert addAction:toggle];
         [alert addAction:dismiss];
-        [topViewController() presentViewController:alert animated:YES completion:nil];
-    }
+        [presenter presentViewController:alert animated:YES completion:^{
+            menuBusy = NO; // 展示完成后，继续由上面的 presentedViewController 判断拦截
+        }];
+    // 兜底：present 失败时 completion 不会调用，避免 menuBusy 卡住导致菜单再也打不开
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        menuBusy = NO;
+    });
 }
 
 %hook UIWindow
@@ -171,6 +186,9 @@ void openSimpleMenu() {
 
     %new
     - (void)handleMenuLongPress:(UILongPressGestureRecognizer *)gesture {
+        // 长按手势在 Began/Changed/Ended 每个状态变化都会回调一次。
+        // 不判断状态的话，点菜单按钮让 alert 消失的瞬间会被再次触发 -> 菜单反复弹出并卡住。
+        if (gesture.state != UIGestureRecognizerStateBegan) return;
         openSimpleMenu();
     }
 
