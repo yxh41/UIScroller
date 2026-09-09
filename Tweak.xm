@@ -331,15 +331,16 @@ void openSimpleMenu() {
     %new
     - (void)handleStopTouch:(UILongPressGestureRecognizer *)gesture {
         if (gesture.state == UIGestureRecognizerStateBegan) {
-            // 记下落下位置，用于判断"是想停，还是想接着拖"
-            objc_setAssociatedObject(self, kTouchStartKey, [gesture locationInView:self], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // 记下落下位置，用于判断"是想停，还是想接着拖"（CGPoint 是结构体，要用 NSValue 装箱）
+            objc_setAssociatedObject(self, kTouchStartKey, [NSValue valueWithCGPoint:[gesture locationInView:self]], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [self brakeUIScroller];
             return;
         }
         if (gesture.state == UIGestureRecognizerStateChanged) {
             // 手指一动（>5pt）= 用户想手动拖 -> 立即交还控制权，不等拖拽判定
             if (!objc_getAssociatedObject(self, kBrakingKey)) return;
-            CGPoint start = [objc_getAssociatedObject(self, kTouchStartKey) CGPointValue];
+            NSValue *startValue = objc_getAssociatedObject(self, kTouchStartKey);
+            CGPoint start = startValue ? [startValue CGPointValue] : CGPointZero;
             CGPoint loc = [gesture locationInView:self];
             if (fabs(loc.x - start.x) > 5.0 || fabs(loc.y - start.y) > 5.0) {
                 [self stopUIScroller];
