@@ -159,6 +159,52 @@ id topViewController() {
     else return rootController;
 }
 
+// ── 自动停止倒计时悬浮窗 ──
+// 只在最后 10 秒出现，1 秒更新一次（不跟屏幕刷新率，功耗可忽略）；
+// 关键：userInteractionEnabled = NO，绝不能挡住 App 自己的触摸。
+static UILabel *hudLabel = nil;
+
+static UILabel *hudEnsureLabel(void) {
+    if (hudLabel && hudLabel.superview) return hudLabel;
+    UIWindow *host = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.windowLevel == UIWindowLevelNormal && !w.hidden) { host = w; break; }
+    }
+    if (!host) return nil;
+    if (!hudLabel) {
+        hudLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+        hudLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
+        hudLabel.textColor = [UIColor whiteColor];
+        hudLabel.font = [UIFont monospacedDigitSystemFontOfSize:13.0 weight:UIFontWeightMedium];
+        hudLabel.textAlignment = NSTextAlignmentCenter;
+        hudLabel.layer.cornerRadius = 6.0;
+        hudLabel.layer.masksToBounds = YES;
+        hudLabel.userInteractionEnabled = NO; // 不挡触摸
+    }
+    [host addSubview:hudLabel];
+    return hudLabel;
+}
+
+static void updateCountdownHUD(int seconds) {
+    if (seconds <= 0) { hudLabel.hidden = YES; return; }
+    UILabel *lab = hudEnsureLabel();
+    if (!lab) return;
+    lab.text = [NSString stringWithFormat:@"自动停止 %d", seconds];
+    [lab sizeToFit];
+    CGFloat w = CGRectGetWidth(lab.bounds) + 16.0;
+    CGFloat h = CGRectGetHeight(lab.bounds) + 8.0;
+    UIView *host = lab.superview;
+    CGFloat top = 26.0;
+    if (@available(iOS 11.0, *)) top = host.safeAreaInsets.top + 6.0;
+    lab.frame = CGRectMake(CGRectGetWidth(host.bounds) - w - 10.0, top, w, h);
+    lab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+    lab.hidden = NO;
+}
+
+static void hideCountdownHUD(void) {
+    hudLabel.hidden = YES;
+}
+
 // 防重入：presentViewController 是异步的，展示动画完成前 topViewController() 还看不到这个 alert。
 // 此时若再次触发就会重复 present —— QQ 等 App 上表现为"点任何按钮菜单都重新弹出并卡住"。
 static BOOL menuBusy = NO;
@@ -482,9 +528,17 @@ void openSimpleMenu() {
 
         if (autoDisableMinutes > 0) {
             [self stopAutoDisableTimer];
-            NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:autoDisableMinutes * 60 repeats:NO block:^(NSTimer * _Nonnull timer){
+            __block int remain = autoDisableMinutes * 60;
+            // 1 秒一次（不是逐帧）：最后 10 秒才把悬浮窗显示出来，其余时间不打扰阅读
+            NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
                 __strong typeof(weakSelf) strongSelf = weakSelf;
-                if (strongSelf) [strongSelf autoDisableScrolling];
+                remain--;
+                if (remain <= 10 && remain > 0) updateCountdownHUD(remain);
+                if (remain <= 0) {
+                    hideCountdownHUD();
+                    [timer invalidate];
+                    if (strongSelf) [strongSelf autoDisableScrolling];
+                }
             }];
             objc_setAssociatedObject(self, kAutoDisableTimerKey, ad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
@@ -498,6 +552,8 @@ void openSimpleMenu() {
             objc_setAssociatedObject(self, kScrollTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         objc_setAssociatedObject(self, kBrakingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 手动停了滚动就把"自动停止"计时器一并清掉，否则到点还会莫名弹提示
+        [self stopAutoDisableTimer];
         // 还原 App 原本的息屏策略（仅当我们改过时才还原）
         if ([objc_getAssociatedObject(self, kIdleTimerSetKey) boolValue]) {
             BOOL prev = [objc_getAssociatedObject(self, kIdleTimerPrevKey) boolValue];
@@ -525,6 +581,7 @@ void openSimpleMenu() {
         if (ad) {
             [ad invalidate];
             objc_setAssociatedObject(self, kAutoDisableTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            hideCountdownHUD(); // 计时器没了，倒计时提示也收掉
         }
     }
 
