@@ -63,10 +63,12 @@ static NSString *speedName(int type) {
     }
 }
 
-// ── 固定挡（慢速/标准/较快/快速）：惯性收敛时间常数（秒）──
-// 接管瞬间速度 = 松手速度 V，随后按 e^(-t/tau) 平滑收敛到稳态速度。
-// 取 ~0.45s 与 iOS 自带减速的衰减尺度接近，看上去就是"惯性自然延续"，不会顿一下。
-static const CFTimeInterval kAutoEaseTau = 0.45;
+// ── 固定挡（慢速/标准/较快/快速）：起步速度收敛到稳态速度的时间常数（秒）──
+// 接管瞬间速度 = 交接实测速度 V（= 手上力道），随后按 e^(-t/tau) 平滑收到档位速度。
+// 1.2s 比原来的 0.45s 舒缓得多：既不会在起步瞬间急刹（"顿一下"），又能较快进入稳定阅读速度。
+static const CFTimeInterval kGearEaseTau = 1.2;
+// 固定挡档位速度（pt/s）
+static const float kGearSpeed[4] = { 80.0f, 160.0f, 240.0f, 320.0f };
 // ── 自动档（松手即自动滚，速度跟随力道，一直滚到用户手动停）──
 // 巡航速度安全上限（pt/s）：只是防止异常数值导致飞天；正常甩动到不了这个量级，实际速度 = 力道。
 static const float kAutoCruiseMax = 3000.0f;
@@ -172,8 +174,22 @@ void openSimpleMenu() {
                                     preferredStyle:UIAlertControllerStyleAlert];
         UIAlertAction *speed = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"速度：%@", speedName(scrollSpeedType)] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
-                                    // 0 慢速 -> 1 标准 -> 2 较快 -> 3 快速 -> 4 自动 -> 回到 0
-                                    scrollSpeedType = (scrollSpeedType >= 4) ? 0 : scrollSpeedType + 1;
+                                    // 直接列出 5 档单选，不用一次 +1 循环点好几次
+                                    UIAlertController *speedSheet = [UIAlertController alertControllerWithTitle:@"选择滚动速度"
+                                                                                                       message:nil
+                                                                                                preferredStyle:UIAlertControllerStyleAlert];
+                                    for (int i = 0; i <= 4; i++) {
+                                        int sel = i; // 每次迭代固定住值，供 block 捕获
+                                        NSString *title = (sel == scrollSpeedType) ?
+                                            [NSString stringWithFormat:@"✓ %@", speedName(sel)] : speedName(sel);
+                                        [speedSheet addAction:[UIAlertAction actionWithTitle:title
+                                                                                       style:UIAlertActionStyleDefault
+                                                                                     handler:^(UIAlertAction *a) {
+                                                                                         scrollSpeedType = sel;
+                                                                                     }]];
+                                    }
+                                    [speedSheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+                                    [topViewController() presentViewController:speedSheet animated:YES completion:nil];
                                 }];
         UIAlertAction *autoDisable = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"自动停止：%@", autoDisableMinutes == 0 ? @"关闭" : [NSString stringWithFormat:@"%d 分钟", autoDisableMinutes]] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
@@ -490,7 +506,7 @@ void openSimpleMenu() {
         // ── 交接观察期（仅自动档）──
         // 让系统自带减速先跑 1~2 帧，用"实测位移 / 实测时间"算出它真实的滚动速度再接手，
         // 起点和系统当时在跑的速度完全一致 -> 起步零跳变；该速度本身就是甩动力道算出来的。
-        if (scrollSpeedType == 4 && [objc_getAssociatedObject(self, kHandoffKey) intValue]) {
+        if ([objc_getAssociatedObject(self, kHandoffKey) intValue]) {
             CFTimeInterval nowT = CACurrentMediaTime();
             double lastOff = [objc_getAssociatedObject(self, kHandoffOffsetKey) doubleValue];
             double lastT = [objc_getAssociatedObject(self, kHandoffTimeKey) doubleValue];
@@ -522,16 +538,11 @@ void openSimpleMenu() {
             if (speed < kAutoStopSpeed) { [self stopUIScroller]; return; }
         } else {
             // 固定挡：稳态速度（pt/s）
-            float steady = 100.0f;
-            if (scrollSpeedType == 0) steady = 50.0f;
-            else if (scrollSpeedType == 1) steady = 100.0f;
-            else if (scrollSpeedType == 2) steady = 150.0f;
-            else if (scrollSpeedType == 3) steady = 200.0f;
-            // 自定义惯性：接管瞬间速度 = 松手速度 v0，之后按 e^(-t/tau) 平滑收敛到稳态速度。
-            // 衰减尺度和 iOS 自带减速接近，所以是"惯性自然延续成定速"，不会先顿一下再起步。
-            // 不要夹到 steady：轻扫时（v0 < steady）需要让它从 v0 平滑"升"到 steady，
-            // 强行取 steady 反而会突跳一下。
-            speed = steady + (float)((v0 - steady) * exp(-t / kAutoEaseTau));
+            float steady = (scrollSpeedType >= 0 && scrollSpeedType <= 3) ? kGearSpeed[scrollSpeedType] : 160.0f;
+            // 自定义惯性：起步速度 = 交接实测速度 v0（= 手上力道），之后按 e^(-t/1.2s)
+            // 平滑收到档位速度。不夹到 steady：轻扫时（v0 < steady）需要让它平滑"升"上去，
+            // 强行取 steady 反而会突跳。
+            speed = steady + (float)((v0 - steady) * exp(-t / kGearEaseTau));
             if (speed < 0.0f) speed = 0.0f;
         }
 
