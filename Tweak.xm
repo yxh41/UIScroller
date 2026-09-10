@@ -45,6 +45,9 @@ static const void *kLastTickKey         = &kLastTickKey;
 static const void *kBrakingKey          = &kBrakingKey;
 static const void *kBrakeStartKey       = &kBrakeStartKey;
 static const void *kTouchStartKey       = &kTouchStartKey;
+static const void *kHandoffKey          = &kHandoffKey;
+static const void *kHandoffOffsetKey    = &kHandoffOffsetKey;
+static const void *kHandoffTimeKey      = &kHandoffTimeKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -65,8 +68,13 @@ static NSString *speedName(int type) {
 // 取 ~0.45s 与 iOS 自带减速的衰减尺度接近，看上去就是"惯性自然延续"，不会顿一下。
 static const CFTimeInterval kAutoEaseTau = 0.45;
 // ── 自动档（松手即自动滚，速度跟随力道，一直滚到用户手动停）──
-// 巡航速度上限（pt/s）：巡航速度 = 松手甩动速度，超过该值钳制（甩太狠也不会快到看不清）。
-static const float kAutoCruiseMax = 800.0f;
+// 巡航速度安全上限（pt/s）：只是防止异常数值导致飞天；正常甩动到不了这个量级，实际速度 = 力道。
+static const float kAutoCruiseMax = 3000.0f;
+// 收尾衰减时间常数（秒）：起步速度 = 交接瞬间的真实速度，之后按 e^(-t/tau) 极缓慢地收，
+// 8s ≈ 10 秒后还有一半速度，既有"一直滚"的持久感，又不会像匀速那样机械。
+static const CFTimeInterval kAutoDecayTau = 8.0;
+// 停止阈值（pt/s）：衰减到该速度以下结束驱动（已慢到看不出在动）。
+static const float kAutoStopSpeed = 20.0f;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
@@ -417,6 +425,12 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kLastTickKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 首帧用默认 1/60s
+        // 交接观察期：先让系统自带减速跑 1~2 帧，实测它真实的滚动速度再接手。
+        // 手指速度（panGestureRecognizer）和系统内部投影速度并不相等，直接拿手指速度起步
+        // 会在第一帧产生速度跳变 —— 就是"起步那一下衔接不自然"的根因。
+        objc_setAssociatedObject(self, kHandoffKey, @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kHandoffOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kHandoffTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         __weak typeof(self) weakSelf = self;
         // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
@@ -473,17 +487,39 @@ void openSimpleMenu() {
 
     %new
     - (void)autoScroll {
+        // ── 交接观察期（仅自动档）──
+        // 让系统自带减速先跑 1~2 帧，用"实测位移 / 实测时间"算出它真实的滚动速度再接手，
+        // 起点和系统当时在跑的速度完全一致 -> 起步零跳变；该速度本身就是甩动力道算出来的。
+        if (scrollSpeedType == 4 && [objc_getAssociatedObject(self, kHandoffKey) intValue]) {
+            CFTimeInterval nowT = CACurrentMediaTime();
+            double lastOff = [objc_getAssociatedObject(self, kHandoffOffsetKey) doubleValue];
+            double lastT = [objc_getAssociatedObject(self, kHandoffTimeKey) doubleValue];
+            double curOff = self.contentOffset.y;
+            double dtObs = nowT - lastT;
+            if (dtObs < 0.008) return;                 // 采样间隔太短，等下一帧
+            double vObs = fabs(curOff - lastOff) / dtObs;
+            if (vObs < kAutoTriggerAuto) { [self stopUIScroller]; return; } // 系统没在减速 -> 放弃接管
+            objc_setAssociatedObject(self, kDragVelocityKey, @(vObs), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(curOff), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kScrollStartKey, @(nowT), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kLastTickKey, @(nowT), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kVerticalDownKey, @(curOff - lastOff > 0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kHandoffKey, @(0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return; // 本帧不动，从下一帧开始按我们的曲线推进
+        }
+
         CGFloat v0 = [objc_getAssociatedObject(self, kDragVelocityKey) doubleValue]; // 接管初速度 pt/s
         CFTimeInterval started = [objc_getAssociatedObject(self, kScrollStartKey) doubleValue];
         CFTimeInterval t = CACurrentMediaTime() - started;
 
         float speed;
         if (scrollSpeedType == 4) {
-            // 自动档：匀速巡航，速度 = 松手甩动速度（跟随力道），一直滚到用户手动停 / 滚到内容尽头。
-            // 按住 0.25s 走刹车段；轻触屏幕会立即交还控制权（beginDragging 停驱动）。
-            speed = (float)v0;
+            // 自动档：起步速度 = 交接瞬间实测速度（= 你的力道），之后极缓慢收速滚下去，
+            // 一直滚到用户手动停（按住 0.25s）/ 轻触交还控制权 / 滚到内容尽头。
+            speed = (float)(v0 * exp(-t / kAutoDecayTau));
             if (speed > kAutoCruiseMax) speed = kAutoCruiseMax;
-            if (speed < kAutoTriggerAuto) speed = kAutoTriggerAuto;
+            if (speed < kAutoStopSpeed) { [self stopUIScroller]; return; }
         } else {
             // 固定挡：稳态速度（pt/s）
             float steady = 100.0f;
