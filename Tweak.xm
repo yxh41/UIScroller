@@ -48,9 +48,12 @@ static const void *kTouchStartKey       = &kTouchStartKey;
 static const void *kHandoffKey          = &kHandoffKey;
 static const void *kHandoffOffsetKey    = &kHandoffOffsetKey;
 static const void *kHandoffTimeKey      = &kHandoffTimeKey;
+static const void *kIdleTimerSetKey     = &kIdleTimerSetKey;
+static const void *kIdleTimerPrevKey    = &kIdleTimerPrevKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
+BOOL keepScreenAwake = NO;  // 自动滚动期间禁止息屏（默认关，菜单里可开）
 
 // 速度档位名（菜单显示用）
 static NSString *speedName(int type) {
@@ -225,6 +228,11 @@ void openSimpleMenu() {
                                     [inputAlert addAction:cancelAction];
                                     [topViewController() presentViewController:inputAlert animated:YES completion:nil];
                                 }];
+        UIAlertAction *awake = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"屏幕常亮：%@", keepScreenAwake ? @"开" : @"关"] style:UIAlertActionStyleDefault
+                                handler:^(UIAlertAction *action) {
+                                    keepScreenAwake = !keepScreenAwake;
+                                    // 关闭时正在进行的滚动会在 stopUIScroller 里自动还原息屏策略
+                                }];
         UIAlertAction *toggle = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@此应用", isDisabled ? @"启用" : @"禁用"] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
                                     if (isDisabled) [[NSUserDefaults standardUserDefaults] setBool:NO forKey:disabledKey()];
@@ -233,6 +241,7 @@ void openSimpleMenu() {
         UIAlertAction *dismiss = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
         [alert addAction:speed];
         [alert addAction:autoDisable];
+        [alert addAction:awake];
         [alert addAction:toggle];
         [alert addAction:dismiss];
         [presenter presentViewController:alert animated:YES completion:^{
@@ -460,6 +469,17 @@ void openSimpleMenu() {
         // 挂上"点一下停止"的手势（只在滚动期间存在）
         [self attachStopTouchGesture];
 
+        // 屏幕常亮（菜单开关，默认关）：程序化滚动不算用户操作，系统照常息屏锁屏，
+        // 开着它才能在长时间自动滚动时保持亮屏。
+        if (keepScreenAwake) {
+            UIApplication *app = [UIApplication sharedApplication];
+            // 先记下 App 原本的息屏策略，停止滚动时还原 —— 不能无脑设 NO，
+            // 否则会把视频/导航类 App 本来就该常亮的状态给关掉。
+            objc_setAssociatedObject(self, kIdleTimerPrevKey, @(app.idleTimerDisabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kIdleTimerSetKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            app.idleTimerDisabled = YES;
+        }
+
         if (autoDisableMinutes > 0) {
             [self stopAutoDisableTimer];
             NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:autoDisableMinutes * 60 repeats:NO block:^(NSTimer * _Nonnull timer){
@@ -478,6 +498,13 @@ void openSimpleMenu() {
             objc_setAssociatedObject(self, kScrollTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
         objc_setAssociatedObject(self, kBrakingKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 还原 App 原本的息屏策略（仅当我们改过时才还原）
+        if ([objc_getAssociatedObject(self, kIdleTimerSetKey) boolValue]) {
+            BOOL prev = [objc_getAssociatedObject(self, kIdleTimerPrevKey) boolValue];
+            [UIApplication sharedApplication].idleTimerDisabled = prev;
+            objc_setAssociatedObject(self, kIdleTimerSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kIdleTimerPrevKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
         [self detachStopTouchGesture];
     }
 
