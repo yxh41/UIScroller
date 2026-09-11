@@ -87,7 +87,9 @@ static const float kAutoStopSpeed = 20.0f;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
-static const float kAutoTriggerAuto = 300.0f;
+// 200pt/s ≈ 每秒划过 1/4 屏高：比原来 300 更灵敏，随手轻甩就能触发自动滚动。
+// 再往下调要小心：太低的慢速拖动也会被接管，就没法"手动慢慢滑"了。
+static const float kAutoTriggerAuto = 200.0f;
 // 刹车时长（秒）：停止时做匀减速（像摩擦制动）滑到 0，而不是瞬间定住。
 // 0.35s 既刹得住又不会显得生硬；想要更干脆就调小。
 static const CFTimeInterval kBrakeDuration = 0.35;
