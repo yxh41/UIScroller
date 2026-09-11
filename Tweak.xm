@@ -82,6 +82,8 @@ static const CFTimeInterval kAutoDecayTau = 8.0;
 // 实测交接速度的合理上限（pt/s）：超过就认为观察窗口被 App 自己的 offset 变动污染了，
 // 回退用松手速度。否则会拿到离谱的速度直接冲到内容边界（表现为"瞬间到顶部"）。
 static const float kAutoVelocitySanity = 4000.0f;
+// 停止阈值（pt/s）：衰减到该速度以下结束驱动（已慢到看不出在动）。
+static const float kAutoStopSpeed = 20.0f;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
