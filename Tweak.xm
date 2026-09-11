@@ -12,6 +12,9 @@
 - (void)handleStopTouch:(UILongPressGestureRecognizer *)gesture;
 - (void)stopAutoDisableTimer;
 - (void)autoDisableScrolling;
+- (void)startAutoNative;
+- (void)stopAutoNative;
+- (void)setupAutoDisableTimer;
 - (void)attachStopTouchGesture;
 - (void)detachStopTouchGesture;
 @end
@@ -55,6 +58,16 @@ static const void *kExpectedOffsetKey   = &kExpectedOffsetKey;
 static const void *kExpectedSetKey      = &kExpectedSetKey;
 static const void *kEdgeWaitKey         = &kEdgeWaitKey;
 static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
+// ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
+static const void *kAutoActiveKey       = &kAutoActiveKey;
+static const void *kAutoV0Key           = &kAutoV0Key;
+static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
+static const void *kAutoLastYKey        = &kAutoLastYKey;
+static const void *kAutoLastTKey        = &kAutoLastTKey;
+static const void *kAutoStallKey        = &kAutoStallKey;
+static const void *kAutoLastCsKey       = &kAutoLastCsKey;
+// 私有 API（_verticalVelocity）维持无效时置 YES：本进程内自动档退回我们自己的驱动
+static BOOL nativeSustainBroken = NO;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -342,6 +355,7 @@ void openSimpleMenu() {
 
         // 离开窗口（复用/移除）时停掉滚动，避免 timer 持有已离屏 scroll view 造成泄漏
         if (self.window == nil) {
+            [self stopAutoNative];
             [self stopUIScroller];
             [self stopAutoDisableTimer];
             return;
@@ -360,6 +374,7 @@ void openSimpleMenu() {
     // 否则我们每帧的绝对定位写入会把内容"锁死"，手指拖不动，就没法手动连续快速滑动。
     - (void)_scrollViewWillBeginDragging {
         %orig;
+        [self stopAutoNative];   // 手指接管：停掉原生续滚
         [self stopUIScroller];
     }
 
@@ -403,7 +418,10 @@ void openSimpleMenu() {
             // velocity.y > 0 表示向下 -> 继续向下滚 -> verticalDown = NO（保持原语义）
             objc_setAssociatedObject(self, kVerticalDownKey, @(vSrc <= 0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(vSrc)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            [self startUIScroller];
+            objc_setAssociatedObject(self, kAutoV0Key, @(fabs(vSrc)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // 自动档：优先让系统自己的滚动动画续滚；私有方法不可用时退回我们的驱动
+            if (nativeSustainBroken) [self startUIScroller];
+            else [self startAutoNative];
             return r;
         }
 
@@ -489,6 +507,12 @@ void openSimpleMenu() {
         if (gesture.state == UIGestureRecognizerStateBegan) {
             // 记下落下位置，用于判断"是想停，还是想接着拖"（CGPoint 是结构体，要用 NSValue 装箱）
             objc_setAssociatedObject(self, kTouchStartKey, [NSValue valueWithCGPoint:[gesture locationInView:self]], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            // 原生续滚模式：先取消系统动画（写一次当前 offset 即可打断平滑滚动）
+            if ([objc_getAssociatedObject(self, kAutoActiveKey) boolValue]) {
+                [self setContentOffset:self.contentOffset animated:NO];
+                [self stopAutoNative];
+                return;
+            }
             [self brakeUIScroller];
             return;
         }
@@ -504,6 +528,49 @@ void openSimpleMenu() {
         }
     }
 
+    // ── 自动档：原生续滚 ──
+    // 思路（对齐 pxcex AutoScroll）：不自己每帧写 contentOffset，而是让 UIScrollView 自己的
+    // 滚动动画继续跑 —— 我们在它的每帧回调里把速度续住。这样 cell 加载、懒加载、吸顶、
+    // Telegram 的位置补偿等全部照常工作（对 App 来说就是"一次很长的减速"），兼容性最好。
+    %new
+    - (void)startAutoNative {
+        objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoStallKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastCsKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [self attachStopTouchGesture];
+        [self setupAutoDisableTimer];
+    }
+
+    %new
+    - (void)stopAutoNative {
+        objc_setAssociatedObject(self, kAutoActiveKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [self detachStopTouchGesture];
+        [self stopAutoDisableTimer];
+    }
+
+    %new
+    - (void)setupAutoDisableTimer {
+        if (autoDisableMinutes <= 0) return;
+        [self stopAutoDisableTimer];
+        __weak typeof(self) weakSelf = self;
+        __block int remain = autoDisableMinutes * 60;
+        NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            remain--;
+            if (remain <= 10 && remain > 0) updateCountdownHUD(remain);
+            if (remain <= 0) {
+                hideCountdownHUD();
+                [timer invalidate];
+                if (strongSelf) [strongSelf autoDisableScrolling];
+            }
+        }];
+        objc_setAssociatedObject(self, kAutoDisableTimerKey, ad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    // 接管：开自己的 CADisplayLink 驱动（固定挡用；自动档优先走 startAutoNative）
     %new
     - (void)startUIScroller {
         [self stopUIScroller];
@@ -757,6 +824,7 @@ void openSimpleMenu() {
 
     %new
     - (void)autoDisableScrolling {
+        [self stopAutoNative];      // 原生续滚也要停
         [self brakeUIScroller];
         [self stopAutoDisableTimer];
         UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller"
@@ -769,6 +837,85 @@ void openSimpleMenu() {
 
 %end
 
+// 系统平滑滚动的每帧回调（UIScrollView 私有方法）。减速/平滑滚动期间每帧都会走到这里。
+// 单独成组：只有在运行时确认这个方法存在时才 %init，否则 %orig 会指向空实现导致崩溃。
+%group NativeSmoothScroll
+
+%hook UIScrollView
+
+    - (void)_smoothScrollWithUpdateTime:(double)time {
+        %orig(time);
+        if (![objc_getAssociatedObject(self, kAutoActiveKey) boolValue]) return;
+
+        CFTimeInterval now = CACurrentMediaTime();
+        double v0 = [objc_getAssociatedObject(self, kAutoV0Key) doubleValue];
+        double t = now - [objc_getAssociatedObject(self, kAutoStartTimeKey) doubleValue];
+        // 与之前同样的"力道 → 缓慢收速"曲线，只是这次是续给系统动画，不是我们自己推进
+        double cruise = v0 * exp(-t / kAutoDecayTau);
+        if (cruise > kAutoCruiseMax) cruise = kAutoCruiseMax;
+        if (cruise < kAutoStopSpeed) { [self stopAutoNative]; return; }
+
+        if (!nativeSustainBroken) {
+            @try {
+                NSNumber *cur = [self valueForKey:@"_verticalVelocity"];
+                if ([cur isKindOfClass:[NSNumber class]]) {
+                    double cv = [cur doubleValue];
+                    if (fabs(cv) < cruise) {
+                        // 保持原有方向，只把大小续上去
+                        double sign = (cv != 0.0) ? (cv > 0.0 ? 1.0 : -1.0)
+                                                  : ([objc_getAssociatedObject(self, kVerticalDownKey) boolValue] ? 1.0 : -1.0);
+                        [self setValue:@(cruise * sign) forKey:@"_verticalVelocity"];
+                    }
+                }
+            } @catch (NSException *e) {
+                nativeSustainBroken = YES; // 私有变量不存在（iOS 版本变了）-> 退回自有驱动
+            }
+        }
+
+        // 进度检测：实际位移远小于预期 => 到底/到顶，或维持手段无效
+        double lastY = [objc_getAssociatedObject(self, kAutoLastYKey) doubleValue];
+        double lastT = [objc_getAssociatedObject(self, kAutoLastTKey) doubleValue];
+        double dt = now - lastT;
+        double dy = fabs(self.contentOffset.y - lastY);
+        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (dt <= 0.0) return;
+
+        double stall = [objc_getAssociatedObject(self, kAutoStallKey) doubleValue];
+        if (dy < cruise * dt * 0.3) stall += dt; else stall = 0.0;
+        objc_setAssociatedObject(self, kAutoStallKey, @(stall), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (stall <= 0.4) return;
+
+        // 内容变高了 = 懒加载出新内容 -> 再等等；否则判定停住
+        double lastCs = [objc_getAssociatedObject(self, kAutoLastCsKey) doubleValue];
+        BOOL grew = (self.contentSize.height - lastCs) > 1.0;
+        objc_setAssociatedObject(self, kAutoLastCsKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoStallKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (grew) return;
+
+        if (!nativeSustainBroken) {
+            // 私有 API 续不动：本进程改用我们自己的驱动，从当前巡航速度接管
+            nativeSustainBroken = YES;
+            objc_setAssociatedObject(self, kDragVelocityKey, @(cruise), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [self stopAutoNative];
+            [self startUIScroller];
+            objc_setAssociatedObject(self, kHandoffKey, @(0), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 已在动，跳过交接测速
+            objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kScrollStartKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kExpectedSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return;
+        }
+        [self stopAutoNative];
+    }
+
+%end
+
+%end
+
 %ctor {
     // 用户 App（/var/containers/Bundle/Application）+ 系统 App（/Applications/，如照片、Safari、设置）。
     // 守护进程在 /usr/libexec、/System/Library 下，SpringBoard 在 /System/Library/CoreServices，
@@ -777,5 +924,11 @@ void openSimpleMenu() {
     if ([executablePath containsString:@"/var/containers/Bundle/Application"] ||
         [executablePath containsString:@"/Applications/"]) {
         %init;
+        // 只有确认 UIScrollView 真的实现了这个私有方法，才挂载"续住系统动画"的钩子
+        if (class_getInstanceMethod([UIScrollView class], @selector(_smoothScrollWithUpdateTime:))) {
+            %init(NativeSmoothScroll);
+        } else {
+            nativeSustainBroken = YES; // 没有该方法 -> 自动档直接走我们自己的驱动
+        }
     }
 }
