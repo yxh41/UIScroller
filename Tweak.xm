@@ -50,6 +50,7 @@ static const void *kHandoffOffsetKey    = &kHandoffOffsetKey;
 static const void *kHandoffTimeKey      = &kHandoffTimeKey;
 static const void *kIdleTimerSetKey     = &kIdleTimerSetKey;
 static const void *kIdleTimerPrevKey    = &kIdleTimerPrevKey;
+static const void *kContentSizeKey      = &kContentSizeKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -78,8 +79,9 @@ static const float kAutoCruiseMax = 3000.0f;
 // 收尾衰减时间常数（秒）：起步速度 = 交接瞬间的真实速度，之后按 e^(-t/tau) 极缓慢地收，
 // 8s ≈ 10 秒后还有一半速度，既有"一直滚"的持久感，又不会像匀速那样机械。
 static const CFTimeInterval kAutoDecayTau = 8.0;
-// 停止阈值（pt/s）：衰减到该速度以下结束驱动（已慢到看不出在动）。
-static const float kAutoStopSpeed = 20.0f;
+// 实测交接速度的合理上限（pt/s）：超过就认为观察窗口被 App 自己的 offset 变动污染了，
+// 回退用松手速度。否则会拿到离谱的速度直接冲到内容边界（表现为"瞬间到顶部"）。
+static const float kAutoVelocitySanity = 4000.0f;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
@@ -376,6 +378,9 @@ void openSimpleMenu() {
             //  - 内容不够滚的一屏视图（微信下拉小程序面板）不接
             //  - 回弹/越界区（下拉刷新等）不接
             if (scrollViewInsidePicker(self)) { [self stopUIScroller]; return r; }
+            // 分页滚动视图（banner / 图片浏览器）不接管：我们连续写 offset 会和它的分页吸附打架，
+            // 下一帧被吸附回第 0 页 —— 就是"滚着滚着瞬间到顶部"
+            if (self.isPagingEnabled) { [self stopUIScroller]; return r; }
             BOOL scrollable = (self.contentSize.height - CGRectGetHeight(self.bounds)) >= kMinScrollableTravel;
             if (!scrollable) { [self stopUIScroller]; return r; }
             UIEdgeInsets insets = self.adjustedContentInset;
@@ -416,7 +421,8 @@ void openSimpleMenu() {
         CGFloat maxOffsetNow = MAX(minOffsetNow, self.contentSize.height + insets.bottom - CGRectGetHeight(self.bounds));
         CGPoint cur = self.contentOffset;
         BOOL inBounceZone = (cur.y < minOffsetNow) || (cur.y > maxOffsetNow);
-        BOOL shouldTakeOver = !isDisabled && vertical && strongEnough && scrollable && !inBounceZone && !pickerLike;
+        // 分页视图不接管（连续写 offset 与分页吸附冲突，会被弹回第一页）
+        BOOL shouldTakeOver = !isDisabled && vertical && strongEnough && scrollable && !inBounceZone && !pickerLike && !self.isPagingEnabled;
 
         if (shouldTakeOver) {
             // velocity.y > 0 表示手指向下滑 -> 继续向下滚 -> verticalDown = NO（保持原语义）
@@ -502,6 +508,7 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kHandoffKey, @(1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kHandoffOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kHandoffTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
         __weak typeof(self) weakSelf = self;
         // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
@@ -598,14 +605,22 @@ void openSimpleMenu() {
             double dtObs = nowT - lastT;
             if (dtObs < 0.008) return;                 // 采样间隔太短，等下一帧
             double vObs = fabs(curOff - lastOff) / dtObs;
-            if (vObs < kAutoTriggerAuto) { [self stopUIScroller]; return; } // 系统没在减速 -> 放弃接管
-            objc_setAssociatedObject(self, kDragVelocityKey, @(vObs), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            double vRelease = [objc_getAssociatedObject(self, kDragVelocityKey) doubleValue]; // 松手速度（备用）
+            BOOL vDownRelease = [objc_getAssociatedObject(self, kVerticalDownKey) boolValue];  // 松手方向（备用）
+            BOOL dirDown = (curOff - lastOff) > 0;
+            // 观察窗口内 App 可能自己动过 offset（折叠/刷新/分页回弹），测出的速度会离谱甚至方向翻转。
+            // 这三条件任一不满足就回退用松手速度 + 松手方向，避免"一脚油门冲到顶"。
+            BOOL sane = (vObs >= kAutoTriggerAuto) && (vObs <= kAutoVelocitySanity) && (dirDown == vDownRelease);
+            double vStart = sane ? vObs : vRelease;
+            if (vStart < kAutoTriggerAuto) { [self stopUIScroller]; return; } // 系统没在减速 -> 放弃接管
+            objc_setAssociatedObject(self, kDragVelocityKey, @(vStart), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(curOff), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kScrollStartKey, @(nowT), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kLastTickKey, @(nowT), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kVerticalDownKey, @(curOff - lastOff > 0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kVerticalDownKey, @(sane ? dirDown : vDownRelease), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kHandoffKey, @(0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             return; // 本帧不动，从下一帧开始按我们的曲线推进
         }
 
@@ -649,6 +664,16 @@ void openSimpleMenu() {
         if (dt < 0.0) dt = 0.0;
         if (dt > 0.05) dt = 0.05; // 卡顿保护：长时间挂起后回到前台，避免一帧跳太远
         objc_setAssociatedObject(self, kLastTickKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+        // 内容高度一变（增量加载/刷新/折叠）就以当前实际偏移重新起算：
+        // 否则基准位置失效会让目标值越界，表现为"滚着滚着瞬间跳到顶/底"。
+        CGFloat csNow = self.contentSize.height;
+        CGFloat csPrev = [objc_getAssociatedObject(self, kContentSizeKey) doubleValue];
+        if (csPrev > 0.0 && fabs(csNow - csPrev) > 1.0) {
+            objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kContentSizeKey, @(csNow), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
 
         double travel = [objc_getAssociatedObject(self, kScrollTravelKey) doubleValue] + (double)speed * dt;
         objc_setAssociatedObject(self, kScrollTravelKey, @(travel), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
