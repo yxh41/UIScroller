@@ -51,6 +51,8 @@ static const void *kHandoffTimeKey      = &kHandoffTimeKey;
 static const void *kIdleTimerSetKey     = &kIdleTimerSetKey;
 static const void *kIdleTimerPrevKey    = &kIdleTimerPrevKey;
 static const void *kContentSizeKey      = &kContentSizeKey;
+static const void *kExpectedOffsetKey   = &kExpectedOffsetKey;
+static const void *kExpectedSetKey      = &kExpectedSetKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -513,6 +515,7 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kHandoffOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kHandoffTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kExpectedSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 新会话：还没写过值，不做比对
 
         __weak typeof(self) weakSelf = self;
         // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
@@ -673,10 +676,23 @@ void openSimpleMenu() {
         // 否则基准位置失效会让目标值越界，表现为"滚着滚着瞬间跳到顶/底"。
         CGFloat csNow = self.contentSize.height;
         CGFloat csPrev = [objc_getAssociatedObject(self, kContentSizeKey) doubleValue];
-        if (csPrev > 0.0 && fabs(csNow - csPrev) > 1.0) {
-            objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kContentSizeKey, @(csNow), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (csPrev > 0.0) {
+            CGFloat dCs = fabs(csNow - csPrev);
+            // 高度突变很大 = 加载历史消息 / 整页刷新（Telegram 聊天向上滚会预插历史记录），
+            // 这种场景 App 自己会重新定位，我们继续接管必然打架 -> 直接退出
+            if (dCs > 200.0) { [self stopUIScroller]; return; }
+            if (dCs > 1.0) {
+                objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kContentSizeKey, @(csNow), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+        }
+
+        // App 自己也在改 offset（聊天记录加载历史后的位置补偿、列表刷新）-> 说明它在抢方向盘，
+        // 我们继续写绝对位置只会互相打断（表现为跳一段再停住）-> 立刻退出接管
+        if ([objc_getAssociatedObject(self, kExpectedSetKey) boolValue]) {
+            double expected = [objc_getAssociatedObject(self, kExpectedOffsetKey) doubleValue];
+            if (fabs(self.contentOffset.y - expected) > 3.0) { [self stopUIScroller]; return; }
         }
 
         double travel = [objc_getAssociatedObject(self, kScrollTravelKey) doubleValue] + (double)speed * dt;
@@ -698,6 +714,9 @@ void openSimpleMenu() {
         CGPoint offset = self.contentOffset;
         offset.y = targetY;
         [self setContentOffset:offset animated:NO];
+        // 记下"我们写进去的值"，下一帧用来判断 App 有没有偷偷改过 offset
+        objc_setAssociatedObject(self, kExpectedOffsetKey, @(targetY), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kExpectedSetKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
     %new
