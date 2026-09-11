@@ -683,11 +683,9 @@ void openSimpleMenu() {
         CGFloat csNow = self.contentSize.height;
         CGFloat csPrev = [objc_getAssociatedObject(self, kContentSizeKey) doubleValue];
         if (csPrev > 0.0) {
-            CGFloat dCs = csNow - csPrev;
-            // 内容大幅"缩水"（折叠/整页替换）-> 位置已无意义，退出
-            if (dCs < -200.0) { [self stopUIScroller]; return; }
-            // 变高（懒加载出一屏新内容）是好事：以当前偏移重新起算继续滚，不要停
-            if (fabs(dCs) > 1.0) {
+            // 内容高度怎么变都只做"重新起算"：变高是懒加载，缩水是预估行高校准/折叠，
+            // 都不该直接停（位置是否还有效交给后面的边界判断处理）
+            if (fabs(csNow - csPrev) > 1.0) {
                 objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kContentSizeKey, @(csNow), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -698,7 +696,14 @@ void openSimpleMenu() {
         // 我们继续写绝对位置只会互相打断（表现为跳一段再停住）-> 立刻退出接管
         if ([objc_getAssociatedObject(self, kExpectedSetKey) boolValue]) {
             double expected = [objc_getAssociatedObject(self, kExpectedOffsetKey) doubleValue];
-            if (fabs(self.contentOffset.y - expected) > 3.0) { [self stopUIScroller]; return; }
+            double dev = self.contentOffset.y - expected;
+            // 大幅偏离 = App 真的抢方向盘（加载历史后的位置补偿等）-> 退出
+            if (fabs(dev) > 25.0) { [self stopUIScroller]; return; }
+            // 小幅偏离（吸顶/安全区变化/导航栏隐藏/像素对齐）：吸收掉重新起算，继续滚，不要停
+            if (fabs(dev) > 1.5) {
+                objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
         }
 
         double travel = [objc_getAssociatedObject(self, kScrollTravelKey) doubleValue] + (double)speed * dt;
