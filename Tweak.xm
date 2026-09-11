@@ -53,6 +53,8 @@ static const void *kIdleTimerPrevKey    = &kIdleTimerPrevKey;
 static const void *kContentSizeKey      = &kContentSizeKey;
 static const void *kExpectedOffsetKey   = &kExpectedOffsetKey;
 static const void *kExpectedSetKey      = &kExpectedSetKey;
+static const void *kEdgeWaitKey         = &kEdgeWaitKey;
+static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -86,6 +88,9 @@ static const CFTimeInterval kAutoDecayTau = 8.0;
 static const float kAutoVelocitySanity = 4000.0f;
 // 停止阈值（pt/s）：衰减到该速度以下结束驱动（已慢到看不出在动）。
 static const float kAutoStopSpeed = 20.0f;
+// 滚到内容尽头后的"贴边等待"时长（秒）：期间保持贴在边界上唤起 App 的加载更多，
+// 等到新内容就继续滚；超时说明真到底了才停。太长会觉得"卡住"，太短来不及触发加载。
+static const CFTimeInterval kEdgeWaitTimeout = 3.0;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
@@ -516,6 +521,7 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kHandoffTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kExpectedSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 新会话：还没写过值，不做比对
+        objc_setAssociatedObject(self, kEdgeWaitKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);    // 新会话：清空贴边等待状态
 
         __weak typeof(self) weakSelf = self;
         // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
@@ -677,11 +683,11 @@ void openSimpleMenu() {
         CGFloat csNow = self.contentSize.height;
         CGFloat csPrev = [objc_getAssociatedObject(self, kContentSizeKey) doubleValue];
         if (csPrev > 0.0) {
-            CGFloat dCs = fabs(csNow - csPrev);
-            // 高度突变很大 = 加载历史消息 / 整页刷新（Telegram 聊天向上滚会预插历史记录），
-            // 这种场景 App 自己会重新定位，我们继续接管必然打架 -> 直接退出
-            if (dCs > 200.0) { [self stopUIScroller]; return; }
-            if (dCs > 1.0) {
+            CGFloat dCs = csNow - csPrev;
+            // 内容大幅"缩水"（折叠/整页替换）-> 位置已无意义，退出
+            if (dCs < -200.0) { [self stopUIScroller]; return; }
+            // 变高（懒加载出一屏新内容）是好事：以当前偏移重新起算继续滚，不要停
+            if (fabs(dCs) > 1.0) {
                 objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kContentSizeKey, @(csNow), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -707,7 +713,32 @@ void openSimpleMenu() {
         CGFloat minOffset = -insets.top;
         CGFloat maxOffset = MAX(minOffset, self.contentSize.height + insets.bottom - CGRectGetHeight(self.bounds));
         if (targetY >= maxOffset || targetY <= minOffset) {
-            [self stopUIScroller];
+            // 滚到当前内容尽头：不立刻停，先"贴边等待"，给 App 触发加载更多的时间。
+            // 我们每帧写 offset 会触发 scrollViewDidScroll / willDisplay，App 的加载逻辑会被唤起。
+            CFTimeInterval nowE = CACurrentMediaTime();
+            id waitStart = objc_getAssociatedObject(self, kEdgeWaitKey);
+            if (!waitStart) {
+                objc_setAssociatedObject(self, kEdgeWaitKey, @(nowE), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kEdgeWaitSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                waitStart = @(nowE);
+            }
+            // 等到了新内容（内容变高）-> 重新起算继续滚
+            if (self.contentSize.height - [objc_getAssociatedObject(self, kEdgeWaitSizeKey) doubleValue] > 1.0) {
+                objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kEdgeWaitKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kExpectedSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                return;
+            }
+            // 等太久还是没新内容 -> 认为真的到底/到顶了
+            if (nowE - [waitStart doubleValue] > kEdgeWaitTimeout) { [self stopUIScroller]; return; }
+            // 保持贴在边界上（持续触发 App 的加载更多），本帧不再推进
+            CGPoint edge = self.contentOffset;
+            edge.y = (targetY >= maxOffset) ? maxOffset : minOffset;
+            [self setContentOffset:edge animated:NO];
+            objc_setAssociatedObject(self, kExpectedOffsetKey, @(edge.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kExpectedSetKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             return;
         }
 
