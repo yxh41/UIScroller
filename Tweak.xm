@@ -67,6 +67,7 @@ static const void *kAutoLastYKey        = &kAutoLastYKey;
 static const void *kAutoLastTKey        = &kAutoLastTKey;
 static const void *kAutoStallKey        = &kAutoStallKey;
 static const void *kAutoLastCsKey       = &kAutoLastCsKey;
+static const void *kAutoLastVKey        = &kAutoLastVKey;
 // 私有 API（_verticalVelocity）维持无效时置 YES：本进程内自动档退回我们自己的驱动
 static BOOL nativeSustainBroken = NO;
 
@@ -102,6 +103,11 @@ static const CFTimeInterval kAutoDecayTau = 8.0;
 static const float kAutoVelocitySanity = 4000.0f;
 // 停止阈值（pt/s）：衰减到该速度以下结束驱动（已慢到看不出在动）。
 static const float kAutoStopSpeed = 20.0f;
+// 速度棘轮（原生续滚）：系统每帧衰减后的速度允许保留的下限比例。
+// 只钳"衰减率"、从不向上顶速度 —— 任何时刻列表承受的速度都不超过 fling 期间
+// 它已经在正常消化的速度，单元格/估算行高就不会被冲进来不及物化的区域（空白）。
+// 0.998/帧 @60Hz ≈ 每秒保留 88%：1500pt/s 的甩动力道 10 秒后还剩约 500，尾感自然。
+static const double kAutoHoldKeepRatio = 0.998;
 // 滚到内容尽头后的"贴边等待"时长（秒）：期间保持贴在边界上唤起 App 的加载更多，
 // 等到新内容就继续滚；超时说明真到底了才停。太长会觉得"卡住"，太短来不及触发加载。
 static const CFTimeInterval kEdgeWaitTimeout = 3.0;
@@ -541,6 +547,7 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoStallKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastCsKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastVKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
     }
@@ -860,28 +867,39 @@ void openSimpleMenu() {
         if (![objc_getAssociatedObject(self, kAutoActiveKey) boolValue]) return;
 
         CFTimeInterval now = CACurrentMediaTime();
-        double v0 = [objc_getAssociatedObject(self, kAutoV0Key) doubleValue];
-        double t = now - [objc_getAssociatedObject(self, kAutoStartTimeKey) doubleValue];
-        // 与之前同样的"力道 → 缓慢收速"曲线，只是这次是续给系统动画，不是我们自己推进
-        double cruise = v0 * exp(-t / kAutoDecayTau);
-        if (cruise > kAutoCruiseMax) cruise = kAutoCruiseMax;
-        if (cruise < kAutoStopSpeed) { [self stopAutoNative]; return; }
 
-        if (!nativeSustainBroken) {
-            @try {
-                NSNumber *cur = [self valueForKey:@"_verticalVelocity"];
-                if ([cur isKindOfClass:[NSNumber class]]) {
-                    double cv = [cur doubleValue];
-                    if (fabs(cv) < cruise) {
-                        // 保持原有方向，只把大小续上去
-                        double sign = (cv != 0.0) ? (cv > 0.0 ? 1.0 : -1.0)
-                                                  : ([objc_getAssociatedObject(self, kVerticalDownKey) boolValue] ? 1.0 : -1.0);
-                        [self setValue:@(cruise * sign) forKey:@"_verticalVelocity"];
-                    }
-                }
-            } @catch (NSException *e) {
-                nativeSustainBroken = YES; // 私有变量不存在（iOS 版本变了）-> 退回自有驱动
+        // ── 速度棘轮（关键：绝不向上顶速度）──
+        // 旧版把 _verticalVelocity 每帧硬顶到由手指松手速度算出的 cruise（上限 3000pt/s），
+        // 远超系统减速动画实际在用的速度 -> 列表被推进到单元格/估算行高来不及物化的区域，
+        // 表现为"滚着滚着空白，碰一下屏幕内容才出现"。pxcex 不注入自己的速度所以不空白。
+        // 现在只读系统当前速度，只钳制衰减率、永不加速：任何时刻的速度都不超过
+        // fling 期间 App 已在正常消化的速度，内容加载完全跟得上。
+        double cv = 0.0;
+        @try {
+            cv = [[self valueForKey:@"_verticalVelocity"] doubleValue];
+        } @catch (NSException *e) {
+            nativeSustainBroken = YES;  // 私有变量不存在（iOS 版本变了）-> 退回自有驱动
+            [self stopAutoNative];
+            [self startUIScroller];
+            return;
+        }
+        // 衰减系数单独兜底：个别版本若没有该 ivar，只影响"抬系数"这一优化，不影响续滚本身
+        @try {
+            double df = [[self valueForKey:@"_decelerationFactor"] doubleValue];
+            if (df > 0.0 && df < kAutoHoldKeepRatio) {
+                [self setValue:@(kAutoHoldKeepRatio) forKey:@"_decelerationFactor"];
             }
+        } @catch (NSException *e) { /* 没有 _decelerationFactor 就只靠速度棘轮 */ }
+        if (fabs(cv) < kAutoStopSpeed) { [self stopAutoNative]; return; }
+
+        double lastV = [objc_getAssociatedObject(self, kAutoLastVKey) doubleValue];
+        objc_setAssociatedObject(self, kAutoLastVKey, @(cv), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (lastV > 1.0 && fabs(cv) < fabs(lastV) * kAutoHoldKeepRatio) {
+            // 系统衰减太快 -> 把速度钳回上一帧的 99.8%（保持原方向，只减不增）
+            double sign = (cv > 0.0) ? 1.0 : -1.0;
+            @try {
+                [self setValue:@(fabs(lastV) * kAutoHoldKeepRatio * sign) forKey:@"_verticalVelocity"];
+            } @catch (NSException *e) { /* 写失败极罕见，下一帧重试 */ }
         }
 
         // 进度检测：实际位移远小于预期 => 到底/到顶，或维持手段无效
@@ -894,7 +912,7 @@ void openSimpleMenu() {
         if (dt <= 0.0) return;
 
         double stall = [objc_getAssociatedObject(self, kAutoStallKey) doubleValue];
-        if (dy < cruise * dt * 0.3) stall += dt; else stall = 0.0;
+        if (dy < fabs(cv) * dt * 0.3) stall += dt; else stall = 0.0;
         objc_setAssociatedObject(self, kAutoStallKey, @(stall), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         if (stall <= 0.4) return;
 
@@ -908,11 +926,10 @@ void openSimpleMenu() {
         if (grew) return;
 
         if (!nativeSustainBroken) {
-            // 原生续滚失效（私有 API 不可用 / 真的到底）：本进程改用我们自己的 CADisplayLink 驱动，
-            // 从当前巡航速度无缝接管。空白问题已由 forceLayoutVisibleCells 在每次写 offset 后
-            // 同步强制布局解决，所以回退路径不会再出现"碰一下才出内容"。
+            // 原生续滚失效（系统动画停了/真的到底）：本进程改用我们自己的 CADisplayLink 驱动，
+            // 从当前速度无缝接管（forceLayoutVisibleCells 已保证该路径不空白）。
             nativeSustainBroken = YES;
-            objc_setAssociatedObject(self, kDragVelocityKey, @(cruise), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(cv)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [self stopAutoNative];
             [self startUIScroller];
             objc_setAssociatedObject(self, kHandoffKey, @(0), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 已在动，跳过交接测速
