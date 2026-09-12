@@ -560,8 +560,10 @@ void openSimpleMenu() {
     // Telegram 的位置补偿等全部照常工作（对 App 来说就是"一次很长的减速"），兼容性最好。
     %new
     - (void)startAutoNative {
-        // 记录续滚起点时刻：配合 kAutoV0Key（松手实测速度）算收尾曲线
+        // 记录续滚起点：贴边检测基准（offset + 时刻）配合 kAutoV0Key（松手实测速度）恒速续滚
         objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
@@ -889,12 +891,13 @@ void openSimpleMenu() {
         %orig(time);
         if (![objc_getAssociatedObject(self, kAutoActiveKey) boolValue]) return;
 
-        // ── 力道跟随续滚：velocity 是驱动本体，必须写；factor 只是辅助 ──
+        // ── 力道跟随恒速续滚：velocity 是驱动本体，必须写；factor 只是辅助 ──
         // 真机实测矩阵：只钉 factor（a4d7758）= velocity 照常自然衰减 = 完全没效果；
-        // factor+velocity 每帧写死 ≈1.0pt/ms（40d3e05）= 能续住但速度钳死 ~1000pt/s，不跟力道。
+        // factor+velocity 每帧写死 ≈1.0pt/ms（40d3e05）= 能续住但速度钳死 ~1000pt/s，不跟力道；
+        // velocity 续 e^(-t/8) 收尾曲线（8a8630c）= 跟力道但 5~18s 就收完，"滚一会自己慢慢停"。
         // 结论：_verticalVelocity 才是滚动驱动变量（写多大滚多快），factor≈1 只防动画提前结束。
-        // 正解：每帧把 velocity 续回"松手实测速度的缓慢收尾曲线" v(t) = min(v0,1.0pt/ms)·e^(-t/8s)。
-        // 轻甩慢滚、重甩快滚（跟随力道）；写入量级 ≤ 甩动本身的速度，App 本来就在消化这个量级，不空白。
+        // 终版：恒速 = 松手实测力道（封顶 1.0pt/ms），一直滚到用户手动停 / 贴边超时 / 定时关。
+        // 写入量级 ≤ 甩动本身的速度，App 本来就在消化这个量级，不空白。
         // 读写全部走直接内存（usc_ivarPtr），不走 KVC —— KVC 会被私有 setter 拦截。
         double *velPtr = usc_ivarPtr(self, "_verticalVelocity");
         double *facPtr = usc_ivarPtr(self, "_decelerationFactor");
@@ -905,19 +908,31 @@ void openSimpleMenu() {
             [self startUIScroller];
             return;
         }
-        double raw = *velPtr;
-        double v = fabs(raw);
-        // v0：松手瞬间 pan 手势的实测速度（pt/s，接管入口存好），换算成 pt/ms 并封顶
-        double v0ptps = [objc_getAssociatedObject(self, kAutoV0Key) doubleValue];
-        double t0     = [objc_getAssociatedObject(self, kAutoStartTimeKey) doubleValue];
-        double target = MIN(v0ptps / 1000.0, kAutoNativeCruiseMaxV) * exp((CACurrentMediaTime() - t0) / -kAutoDecayTau);
-        if (target < kAutoNativeStopV) {
-            // 曲线已收完（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
+        // 贴边检测：offset 连续 kEdgeWaitTimeout 秒没动 = 内容真到底了，
+        // 别再顶着边界较劲（也避免加载更多失败时永远停不下来），交还系统。
+        CGFloat y = self.contentOffset.y;
+        CGFloat lastY = [objc_getAssociatedObject(self, kAutoLastYKey) doubleValue];
+        CFTimeInterval lastT = [objc_getAssociatedObject(self, kAutoLastTKey) doubleValue];
+        CFTimeInterval now = CACurrentMediaTime();
+        if (fabs(y - lastY) > 0.5) {
+            objc_setAssociatedObject(self, kAutoLastYKey, @(y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } else if (lastT > 0.0 && now - lastT > kEdgeWaitTimeout) {
             [self stopAutoNative];
             return;
         }
-        if (v >= target) return;   // 系统速度仍在曲线上方（刚松手的快段）：不干预，任其自然衰减
-        // 系统自然衰减（~21%/s）快于曲线（~12.5%/s），掉到曲线下方就把速度续回曲线上
+        double raw = *velPtr;
+        double v = fabs(raw);
+        // 恒速目标：松手瞬间 pan 手势的实测速度（pt/s，接管入口存好），换算 pt/ms 并封顶
+        double v0ptps = [objc_getAssociatedObject(self, kAutoV0Key) doubleValue];
+        double target = MIN(v0ptps / 1000.0, kAutoNativeCruiseMaxV);
+        if (target < kAutoNativeStopV) {
+            // 力道异常地小（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
+            [self stopAutoNative];
+            return;
+        }
+        if (v >= target) return;   // 系统速度仍在目标之上（刚松手的快段）：不干预，任其自然衰减
+        // 系统自然衰减把速度掉到目标之下：续回目标速度，同时钉 factor 防动画提前结束
         if (!objc_getAssociatedObject(self, kOrigFactorKey)) {
             objc_setAssociatedObject(self, kOrigFactorKey,
                                      [NSNumber numberWithDouble:*facPtr],
