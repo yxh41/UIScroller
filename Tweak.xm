@@ -133,8 +133,9 @@ static double *usc_ivarPtr(id obj, const char *name) {
     return (double *)((char *)(__bridge void *)obj + ivar_getOffset(iv));
 }
 // 滚到内容尽头后的"贴边等待"时长（秒）：期间保持贴在边界上唤起 App 的加载更多，
-// 等到新内容就继续滚；超时说明真到底了才停。太长会觉得"卡住"，太短来不及触发加载。
-static const CFTimeInterval kEdgeWaitTimeout = 3.0;
+// 等到新内容就继续滚；超时说明真到底了才停。微信分段加载消息实测加载圈常转 3~5s，
+// 3s 太短会"圈没转完就停"，放宽到 6s；真到底时贴边 6s 略久，但按一下屏幕随时可停。
+static const CFTimeInterval kEdgeWaitTimeout = 6.0;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
@@ -610,6 +611,7 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastCsKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
@@ -956,13 +958,19 @@ void openSimpleMenu() {
         }
         // 贴边检测：offset 连续 kEdgeWaitTimeout 秒没动 = 内容真到底了，
         // 别再顶着边界较劲（也避免加载更多失败时永远停不下来），交还系统。
+        // 例外：等待期间 contentSize 变了 = App 的加载真的插入了新内容，
+        // 重置等待计时继续滚 —— 微信分段加载消息"圈转几秒才出内容"靠这条续上。
         CGFloat y = self.contentOffset.y;
         CGFloat lastY = [objc_getAssociatedObject(self, kAutoLastYKey) doubleValue];
         CFTimeInterval lastT = [objc_getAssociatedObject(self, kAutoLastTKey) doubleValue];
         CFTimeInterval now = CACurrentMediaTime();
-        if (fabs(y - lastY) > 0.5) {
+        CGFloat csH = self.contentSize.height;
+        CGFloat lastCs = [objc_getAssociatedObject(self, kAutoLastCsKey) doubleValue];
+        BOOL contentChanged = lastCs > 0.0 && fabs(csH - lastCs) > 0.5;
+        if (fabs(y - lastY) > 0.5 || contentChanged) {
             objc_setAssociatedObject(self, kAutoLastYKey, @(y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kAutoLastCsKey, @(csH), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         } else if (lastT > 0.0 && now - lastT > kEdgeWaitTimeout) {
             [self stopAutoNative];
             return;
