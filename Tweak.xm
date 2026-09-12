@@ -869,13 +869,16 @@ void openSimpleMenu() {
         %orig(time);
         if (![objc_getAssociatedObject(self, kAutoActiveKey) boolValue]) return;
 
-        // ── pxcex 同款算法（常量取自其 dylib 反汇编）：只钉衰减系数，绝不注入速度 ──
-        // _verticalVelocity 单位是 pt/ms。快段（≥1.0，>1000pt/s）完全不动，让系统自然衰减
-        // ——任何时刻的速度都是系统自己的值，App 的单元格/估算行高渲染毫无压力（不空白的根本原因）。
-        // 速度自然衰减进 100~1000pt/s 收尾区间后，把 _decelerationFactor 钉在 ≈1.0，
-        // 系统就以"当时自己的速度"近乎匀速滑下去：你快它快、你慢它慢，直到手动停/内容到头。
+        // ── pxcex 同款（反汇编实证）：每帧同时钉 factor + velocity，缺一不可 ──
+        // _verticalVelocity 单位 pt/ms。快段（≥1.0，>1000pt/s）完全不动，任由系统自然衰减
+        // ——App 的单元格/估算行高渲染毫无压力（不空白的根本原因）。
+        // 速度自然衰减进 [0.1, 1.0)（100~1000pt/s）后，每帧把 velocity 重写回 ≈1.0 pt/ms
+        // （≈1000pt/s 巡航）并把 _decelerationFactor 钉在 ≈1.0 防止动画提前结束。
+        // 关键：两个都要写。factor 的正常值 ≈1.9921875（系统每帧乘数 = factor/2 ≈ 0.996），
+        // 只写 factor≈1 不重写 velocity = 每帧速度减半 => 一抬手就急刹（上一版踩的坑）。
         @try {
-            double v = fabs([[self valueForKey:@"_verticalVelocity"] doubleValue]);
+            double raw = [[self valueForKey:@"_verticalVelocity"] doubleValue];
+            double v = fabs(raw);
             if (v < kAutoNativeStopV) {
                 // 已慢到不值得续（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
                 [self stopAutoNative];
@@ -888,7 +891,10 @@ void openSimpleMenu() {
                                              [self valueForKey:@"_decelerationFactor"],
                                              OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 }
+                // 方向跟随当前速度；大小钉到 pxcex 的巡航值
+                double sign = (raw < 0.0) ? -1.0 : 1.0;
                 [self setValue:@(kAutoNativeHoldFactor) forKey:@"_decelerationFactor"];
+                [self setValue:@(kAutoNativeHoldFactor * sign) forKey:@"_verticalVelocity"];
             }
         } @catch (NSException *e) {
             nativeSustainBroken = YES;  // 私有 ivar 不存在（iOS 版本变了）-> 退回自有驱动
