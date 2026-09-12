@@ -71,12 +71,12 @@ static const void *kAutoActiveKey       = &kAutoActiveKey;
 static const void *kCornerGestureKey    = &kCornerGestureKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
 static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
-static const void *kAutoLastYKey        = &kAutoLastYKey;
-static const void *kAutoLastTKey        = &kAutoLastTKey;
 static const void *kAutoStallKey        = &kAutoStallKey;
 static const void *kOrigFactorKey       = &kOrigFactorKey;
 // 私有 API（_verticalVelocity）维持无效时置 YES：本进程内自动档退回我们自己的驱动
 static BOOL nativeSustainBroken = NO;
+// 常亮兜底重断言的帧计数（每 60 帧写一次 idleTimerDisabled）
+static int uscAwakeTick = 0;
 
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
@@ -129,14 +129,31 @@ static const double kAutoNativeCruiseMaxV = 1.0;
 // 关键差异（血泪教训）：不能用 KVC（setValue:forKey:）写这两个私有 ivar ——
 // UIScrollView 的私有 setter 会拦截/钳制写入，表现为"自动档没作用"或"急刹"。
 // pxcex 用 class_getInstanceVariable + ivar_getOffset 直捣内存，我们也逐字节等价地这么干。
-static double *usc_ivarPtr(id obj, const char *name) {
-    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
-    if (!iv) return NULL;
-    return (double *)((char *)(__bridge void *)obj + ivar_getOffset(iv));
+//
+// 性能：ivar 定义在 UIScrollView 上，实例布局固定 => 偏移只解析一次并缓存，
+// 之后每帧直接"对象地址 + 偏移"，省掉两次 class_getInstanceVariable/ivar_getOffset。
+static ptrdiff_t uscVelOffset = -1;
+static ptrdiff_t uscFacOffset = -1;
+static void uscResolveOffsets(void) {
+    Ivar v = class_getInstanceVariable([UIScrollView class], "_verticalVelocity");
+    Ivar f = class_getInstanceVariable([UIScrollView class], "_decelerationFactor");
+    uscVelOffset = v ? ivar_getOffset(v) : -1;
+    uscFacOffset = f ? ivar_getOffset(f) : -1;
 }
-// 滚到内容尽头后贴边的时长（秒）：钉在边界上滑不动就停，别一直较劲。
-// QQ/微信的懒加载不认程序化信号（只认真实手指回拉），贴边等待已验证无意义，
-// 这里只留 1 秒缓冲避免"撞墙急停"的手感；到点交还系统自然滑停。
+static inline double *usc_velPtr(id obj) {
+    if (uscVelOffset < 0) uscResolveOffsets();
+    if (uscVelOffset < 0) return NULL;
+    return (double *)((char *)(__bridge void *)obj + uscVelOffset);
+}
+static inline double *usc_facPtr(id obj) {
+    if (uscFacOffset < 0) uscResolveOffsets();
+    if (uscFacOffset < 0) return NULL;
+    return (double *)((char *)(__bridge void *)obj + uscFacOffset);
+}
+
+// 贴边等待时长（秒）：现在只用于固定挡/回退的 CADisplayLink 驱动路径
+// （滚到尽头再等一会儿唤起加载更多）。自动档的原生续滚已按用户要求去掉贴边行为
+// —— 顶到内容尽头就一直贴着，直到用户触摸停止或定时自动关（pxcex 行为）。
 static const CFTimeInterval kEdgeWaitTimeout = 1.0;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
@@ -625,8 +642,6 @@ void openSimpleMenu() {
         [self applyKeepAwakeIfEnabled];
         // 记录续滚起点：贴边检测基准（offset + 时刻）配合 kAutoV0Key（松手实测速度）恒速续滚
         objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
@@ -640,7 +655,7 @@ void openSimpleMenu() {
         NSNumber *origFactor = objc_getAssociatedObject(self, kOrigFactorKey);
         if (origFactor) {
             objc_setAssociatedObject(self, kOrigFactorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            double *facPtr = usc_ivarPtr(self, "_decelerationFactor");
+            double *facPtr = usc_facPtr(self);
             if (facPtr) *facPtr = [origFactor doubleValue];
         }
         [self detachStopTouchGesture];
@@ -972,9 +987,9 @@ void openSimpleMenu() {
         // 结论：_verticalVelocity 才是滚动驱动变量（写多大滚多快），factor≈1 只防动画提前结束。
         // 终版：恒速 = 松手实测力道（封顶 1.0pt/ms），一直滚到用户手动停 / 贴边超时 / 定时关。
         // 写入量级 ≤ 甩动本身的速度，App 本来就在消化这个量级，不空白。
-        // 读写全部走直接内存（usc_ivarPtr），不走 KVC —— KVC 会被私有 setter 拦截。
-        double *velPtr = usc_ivarPtr(self, "_verticalVelocity");
-        double *facPtr = usc_ivarPtr(self, "_decelerationFactor");
+        // 读写全部走直接内存（usc_velPtr / usc_facPtr），不走 KVC —— KVC 会被私有 setter 拦截。
+        double *velPtr = usc_velPtr(self);
+        double *facPtr = usc_facPtr(self);
         if (!velPtr || !facPtr) {
             // 私有 ivar 不存在（iOS 版本变了）-> 退回自有驱动
             nativeSustainBroken = YES;
@@ -982,21 +997,13 @@ void openSimpleMenu() {
             [self startUIScroller];
             return;
         }
-        // 贴边检测：offset 连续 kEdgeWaitTimeout(1s) 秒没动 = 顶到内容尽头，
-        // 别再顶着边界较劲，把速度归零交还系统自然滑停。
-        // （贴边等待/模拟回拉已验证无意义并移除：QQ/微信的懒加载只认真实手指回拉，
-        // 程序化信号一概不认。velPtr=0 让动画自然结束，保住 didEndDecelerating 回调。）
-        CGFloat y = self.contentOffset.y;
-        CGFloat lastY = [objc_getAssociatedObject(self, kAutoLastYKey) doubleValue];
-        CFTimeInterval lastT = [objc_getAssociatedObject(self, kAutoLastTKey) doubleValue];
-        CFTimeInterval now = CACurrentMediaTime();
-        if (fabs(y - lastY) > 0.5) {
-            objc_setAssociatedObject(self, kAutoLastYKey, @(y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        } else if (lastT > 0.0 && now - lastT > kEdgeWaitTimeout) {
-            *velPtr = 0.0;
-            [self stopAutoNative];
-            return;
+        // 常亮兜底重断言：微信等 App 会自己把 idleTimerDisabled 改回 NO（iOS 16 上必现），
+        // 所以每约 60 帧（≈1 秒）再写一次，比只在启动时设一次可靠得多，开销可忽略。
+        if (keepScreenAwake) {
+            if (++uscAwakeTick >= 60) {
+                uscAwakeTick = 0;
+                [UIApplication sharedApplication].idleTimerDisabled = YES;
+            }
         }
         double raw = *velPtr;
         double v = fabs(raw);
