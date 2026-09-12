@@ -20,6 +20,11 @@
 - (void)forceLayoutVisibleCells;
 @end
 
+@interface UIWindow (UIScroller)
+- (void)handleMenuLongPress:(UILongPressGestureRecognizer *)gesture;
+- (void)handleCornerLongPress:(UILongPressGestureRecognizer *)gesture;
+@end
+
 // CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
 // 否则 self -> associatedObject(link) -> proxy -> self 形成 retain cycle 无法释放。
 @interface UIScrollerTickProxy : NSObject
@@ -145,6 +150,13 @@ static const float kAutoTriggerVelocity = 700.0f;
 // "按住即停"需要按住的时长（秒）：设成 0 会让连续快速甩动时每一次触屏都触发刹车，
 // 干扰手动滑。0.25s 足以过滤掉甩动（甩动从触屏到抬手一般 <0.15s），又不会觉得迟钝。
 static const NSTimeInterval kStopTouchDuration = 0.25;
+// ── 菜单手势：左下角长按（与三指长按并存，哪个顺手用哪个）──
+// 触发扇形半径（pt）：圆心 = 屏幕左下角点。56pt ≈ 指甲盖大的角尖区域，
+// 不会被列表滑动/点按钮摸到；重叠的仅是 tab 栏最左端按钮，由 UIControl 守卫让位。
+static const CGFloat kMenuCornerRadius = 56.0f;
+// 按住时长（秒）：比"按住即停"的 0.25s 长 —— 自动滚动中按角落先触发即停，
+// 继续按满 0.6s 再弹菜单，一次按住两件事互不抢。
+static const NSTimeInterval kMenuCornerHold = 0.6;
 // 接管还要求内容真的够滚（可滚距离下限 pt）：像微信下拉小程序面板这种一屏放得下的视图，
 // 没有可滚的距离，接管只会打断它自己的回弹/动画，看起来就是卡住
 static const float kMinScrollableTravel = 120.0f;
@@ -361,6 +373,11 @@ void openSimpleMenu() {
         UILongPressGestureRecognizer *menuGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
         menuGestureRecognizer.numberOfTouchesRequired = 3;
         [self addGestureRecognizer:menuGestureRecognizer];
+        // 左下角长按：单指按住 0.6s，比三指长按好按且几乎不会误触（见 handleCornerLongPress 内守卫）
+        UILongPressGestureRecognizer *cornerGesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleCornerLongPress:)];
+        cornerGesture.numberOfTouchesRequired = 1;
+        cornerGesture.minimumPressDuration = kMenuCornerHold;
+        [self addGestureRecognizer:cornerGesture];
         objc_setAssociatedObject(self, kMenuAddedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
@@ -369,6 +386,25 @@ void openSimpleMenu() {
         // 长按手势在 Began/Changed/Ended 每个状态变化都会回调一次。
         // 不判断状态的话，点菜单按钮让 alert 消失的瞬间会被再次触发 -> 菜单反复弹出并卡住。
         if (gesture.state != UIGestureRecognizerStateBegan) return;
+        openSimpleMenu();
+    }
+
+    %new
+    - (void)handleCornerLongPress:(UILongPressGestureRecognizer *)gesture {
+        if (gesture.state != UIGestureRecognizerStateBegan) return;
+        // 1) 落点必须在左下角扇形内（圆心 = 屏幕左下角点，半径 kMenuCornerRadius）
+        CGPoint p = [gesture locationInView:self];
+        CGFloat dx = p.x, dy = p.y - CGRectGetHeight(self.bounds);
+        if (sqrt(dx * dx + dy * dy) > (CGFloat)kMenuCornerRadius) return;
+        // 2) UIControl 守卫：落点命中任何按钮类控件（tab 栏的 UITabBarButton、工具栏、FAB）
+        //    就让位给 App，不触发菜单 —— 切 tab、点按钮零冲突。
+        UIView *hit = [self hitTest:p withEvent:nil];
+        for (UIView *v = hit; v; v = v.superview) {
+            if ([v isKindOfClass:[UIControl class]]) return;
+        }
+        // 3) 震动反馈（长按没反馈容易不知道有没有用上劲）+ 弹菜单（内部有 menuBusy 防重入）
+        UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+        [haptic impactOccurred];
         openSimpleMenu();
     }
 
