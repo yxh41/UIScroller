@@ -108,8 +108,8 @@ static const float kAutoStopSpeed = 20.0f;
 // （0.1~1.0 pt/ms ≈ 100~1000 pt/s，正是普通甩动的收尾速度段）。
 // 收尾区间下限：|v| < 0.1 pt/ms（<100pt/s）不再钉系数，交还系统自然滑停。
 static const double kAutoNativeStopV = 0.1;
-// 衰减系数原厂值（dylib 常量 0x3FEFE00000000000）：系统每帧乘数 = factor/2 ≈ 0.996。
-static const double kAutoNativeStockFactor = 0.99609375;
+// 衰减系数原厂值参考（dylib 常量 0x3FEFE00000000000）：系统每帧乘数 = factor/2 ≈ 0.996。
+// 实际恢复用的原值在第一次钉住时从 ivar 里实测保存（见 hook 内 kOrigFactorKey）。
 // 钉住值 = (double)(float)(PinBase + |v|*PinEps)，pxcex 反汇编逐字对应：
 // 0.999999404 是 float 1.0 以下最近的值；eps 项让钉值随速度微增（纯装饰，量级 1e-7）。
 // ≈1 => 系统几乎不减速，以"进入收尾区间那一刻自己的速度"近乎匀速滑下去。
