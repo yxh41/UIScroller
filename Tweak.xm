@@ -152,7 +152,7 @@ static const float kAutoTriggerVelocity = 700.0f;
 static const NSTimeInterval kStopTouchDuration = 0.25;
 // ── 菜单手势：左下角长按（与三指长按并存，哪个顺手用哪个）──
 // 触发扇形半径（pt）：圆心 = 屏幕左下角点。56pt ≈ 指甲盖大的角尖区域，
-// 不会被列表滑动/点按钮摸到；重叠的仅是 tab 栏最左端按钮，由 UIControl 守卫让位。
+// 不会被列表滑动摸到；与 tab 栏最左端按钮的重叠场景由菜单里的"禁用角落手势"按 App 关掉。
 static const CGFloat kMenuCornerRadius = 56.0f;
 // 按住时长（秒）：比"按住即停"的 0.25s 长 —— 自动滚动中按角落先触发即停，
 // 继续按满 0.6s 再弹菜单，一次按住两件事互不抢。
@@ -165,6 +165,13 @@ static const float kMinScrollableTravel = 120.0f;
 static NSString *disabledKey() {
     NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
     return [NSString stringWithFormat:@"uiscroller_disabled_%@", bid];
+}
+
+// 左下角长按菜单手势的 per-app 禁用 key：部分 App 底部角落有自己的长按功能
+// （拖拽排序、清除角标等），这种 App 在菜单里关掉角落手势即可 —— 三指长按仍可弹菜单。
+static NSString *cornerDisabledKey() {
+    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    return [NSString stringWithFormat:@"uiscroller_corner_disabled_%@", bid];
 }
 
 // 判断 scroll view 是否在 WKWebView/UIWebView 内部（往 WKScrollView 上挂 tap 会让网页输入框点不动）
@@ -348,11 +355,17 @@ void openSimpleMenu() {
                                     if (isDisabled) [[NSUserDefaults standardUserDefaults] setBool:NO forKey:disabledKey()];
                                     else [[NSUserDefaults standardUserDefaults] setBool:YES forKey:disabledKey()];
                                 }];
+        BOOL cornerDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()];
+        UIAlertAction *cornerToggle = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@角落手势", cornerDisabled ? @"启用" : @"禁用"] style:UIAlertActionStyleDefault
+                                handler:^(UIAlertAction *action) {
+                                    [[NSUserDefaults standardUserDefaults] setBool:(!cornerDisabled) forKey:cornerDisabledKey()];
+                                }];
         UIAlertAction *dismiss = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
         [alert addAction:speed];
         [alert addAction:autoDisable];
         [alert addAction:awake];
         [alert addAction:toggle];
+        [alert addAction:cornerToggle];
         [alert addAction:dismiss];
         [presenter presentViewController:alert animated:YES completion:^{
             menuBusy = NO; // 展示完成后，继续由上面的 presentedViewController 判断拦截
@@ -392,17 +405,14 @@ void openSimpleMenu() {
     %new
     - (void)handleCornerLongPress:(UILongPressGestureRecognizer *)gesture {
         if (gesture.state != UIGestureRecognizerStateBegan) return;
+        // per-app 禁用：部分 App 底部角落有自己的长按功能（拖拽排序/清除角标等），
+        // 在菜单里关掉角落手势即可 —— 触发频率低，每次读一次 NSUserDefaults 开销可忽略。
+        if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) return;
         // 1) 落点必须在左下角扇形内（圆心 = 屏幕左下角点，半径 kMenuCornerRadius）
         CGPoint p = [gesture locationInView:self];
         CGFloat dx = p.x, dy = p.y - CGRectGetHeight(self.bounds);
         if (sqrt(dx * dx + dy * dy) > (CGFloat)kMenuCornerRadius) return;
-        // 2) UIControl 守卫：落点命中任何按钮类控件（tab 栏的 UITabBarButton、工具栏、FAB）
-        //    就让位给 App，不触发菜单 —— 切 tab、点按钮零冲突。
-        UIView *hit = [self hitTest:p withEvent:nil];
-        for (UIView *v = hit; v; v = v.superview) {
-            if ([v isKindOfClass:[UIControl class]]) return;
-        }
-        // 3) 震动反馈（长按没反馈容易不知道有没有用上劲）+ 弹菜单（内部有 menuBusy 防重入）
+        // 2) 震动反馈（长按没反馈容易不知道有没有用上劲）+ 弹菜单（内部有 menuBusy 防重入）
         UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
         [haptic impactOccurred];
         openSimpleMenu();
