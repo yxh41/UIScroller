@@ -884,13 +884,13 @@ void openSimpleMenu() {
         %orig(time);
         if (![objc_getAssociatedObject(self, kAutoActiveKey) boolValue]) return;
 
-        // ── pxcex 同款（反汇编实证）：每帧同时钉 factor + velocity，缺一不可 ──
+        // ── pxcex 同款（反汇编实证）：每帧只钉 factor，从不写 velocity ──
         // _verticalVelocity 单位 pt/ms。快段（≥1.0，>1000pt/s）完全不动，任由系统自然衰减
         // ——App 的单元格/估算行高渲染毫无压力（不空白的根本原因）。
-        // 速度自然衰减进 [0.1, 1.0)（100~1000pt/s）后，把 factor 钉在 ≈1.0 防止动画提前结束，
-        // 并把 velocity 钉回当前量级（不让系统继续衰减）。方向始终跟随原速度。
-        // 关键：两个都要写。只写 factor 不重写 velocity => 每帧速度继续按原厂比例衰减，
-        // 配合被钉死的大 factor 会提前进入低速区 => 一抬手就急刹（上一版踩的坑）。
+        // 速度自然衰减进 [0.1, 1.0)（100~1000pt/s）后，把 factor 钉在 ≈1.0（每帧乘数≈1，
+        // 速度不再衰减）——速度就停在进入区间那一刻的值 => 甩多重就滚多快，跟随力道。
+        // 血泪教训：如果把 velocity 也每帧写回 ≈1.0pt/ms，速度会被钳死在 ~1000pt/s，
+        // 无论甩多轻都一样快（上一版真机实测）。只写 factor，velocity 交给系统。
         // 读写全部走直接内存（usc_ivarPtr），不走 KVC —— KVC 会被私有 setter 拦截。
         double *velPtr = usc_ivarPtr(self, "_verticalVelocity");
         double *facPtr = usc_ivarPtr(self, "_decelerationFactor");
@@ -915,11 +915,8 @@ void openSimpleMenu() {
                                          [NSNumber numberWithDouble:*facPtr],
                                          OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
-            // 钉值 = pxcex 反汇编逐字对应的公式；速度方向跟随原值
-            double sign = (raw < 0.0) ? -1.0 : 1.0;
-            double pin  = (double)(float)(kAutoNativePinBase + v * kAutoNativePinEps);
-            *facPtr = pin;
-            *velPtr = pin * sign;
+            // 钉值 = pxcex 反汇编逐字对应的公式；velocity 一概不碰
+            *facPtr = (double)(float)(kAutoNativePinBase + v * kAutoNativePinEps);
         }
     }
 
