@@ -108,9 +108,22 @@ static const float kAutoStopSpeed = 20.0f;
 // （0.1~1.0 pt/ms ≈ 100~1000 pt/s，正是普通甩动的收尾速度段）。
 // 收尾区间下限：|v| < 0.1 pt/ms（<100pt/s）不再钉系数，交还系统自然滑停。
 static const double kAutoNativeStopV = 0.1;
-// 钉住的衰减系数（float 1.0 以下最近值）：≈1 => 系统几乎不减速，
-// 以"进入收尾区间那一刻自己的速度"近乎匀速滑下去。全程不注入速度 => 永不空白。
-static const double kAutoNativeHoldFactor = 0.9999994;
+// 衰减系数原厂值（dylib 常量 0x3FEFE00000000000）：系统每帧乘数 = factor/2 ≈ 0.996。
+static const double kAutoNativeStockFactor = 0.99609375;
+// 钉住值 = (double)(float)(PinBase + |v|*PinEps)，pxcex 反汇编逐字对应：
+// 0.999999404 是 float 1.0 以下最近的值；eps 项让钉值随速度微增（纯装饰，量级 1e-7）。
+// ≈1 => 系统几乎不减速，以"进入收尾区间那一刻自己的速度"近乎匀速滑下去。
+static const double kAutoNativePinBase = 0.9999994039535522;
+static const double kAutoNativePinEps  = 5.364418e-07;
+
+// 关键差异（血泪教训）：不能用 KVC（setValue:forKey:）写这两个私有 ivar ——
+// UIScrollView 的私有 setter 会拦截/钳制写入，表现为"自动档没作用"或"急刹"。
+// pxcex 用 class_getInstanceVariable + ivar_getOffset 直捣内存，我们也逐字节等价地这么干。
+static double *usc_ivarPtr(id obj, const char *name) {
+    Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
+    if (!iv) return NULL;
+    return (double *)((char *)(__bridge void *)obj + ivar_getOffset(iv));
+}
 // 滚到内容尽头后的"贴边等待"时长（秒）：期间保持贴在边界上唤起 App 的加载更多，
 // 等到新内容就继续滚；超时说明真到底了才停。太长会觉得"卡住"，太短来不及触发加载。
 static const CFTimeInterval kEdgeWaitTimeout = 3.0;
@@ -552,11 +565,13 @@ void openSimpleMenu() {
     %new
     - (void)stopAutoNative {
         objc_setAssociatedObject(self, kAutoActiveKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        // 恢复被钉住的衰减系数，否则下一次手指拖拽几乎不减速（手感被破坏）
+        // 恢复被钉住的衰减系数，否则下一次手指拖拽几乎不减速（手感被破坏）。
+        // 恢复也走直接内存（与写入路径一致），并兜底恢复原厂值。
         NSNumber *origFactor = objc_getAssociatedObject(self, kOrigFactorKey);
         if (origFactor) {
             objc_setAssociatedObject(self, kOrigFactorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            @try { [self setValue:origFactor forKey:@"_decelerationFactor"]; } @catch (NSException *e) {}
+            double *facPtr = usc_ivarPtr(self, "_decelerationFactor");
+            if (facPtr) *facPtr = [origFactor doubleValue];
         }
         [self detachStopTouchGesture];
         [self stopAutoDisableTimer];
@@ -872,35 +887,39 @@ void openSimpleMenu() {
         // ── pxcex 同款（反汇编实证）：每帧同时钉 factor + velocity，缺一不可 ──
         // _verticalVelocity 单位 pt/ms。快段（≥1.0，>1000pt/s）完全不动，任由系统自然衰减
         // ——App 的单元格/估算行高渲染毫无压力（不空白的根本原因）。
-        // 速度自然衰减进 [0.1, 1.0)（100~1000pt/s）后，每帧把 velocity 重写回 ≈1.0 pt/ms
-        // （≈1000pt/s 巡航）并把 _decelerationFactor 钉在 ≈1.0 防止动画提前结束。
-        // 关键：两个都要写。factor 的正常值 ≈1.9921875（系统每帧乘数 = factor/2 ≈ 0.996），
-        // 只写 factor≈1 不重写 velocity = 每帧速度减半 => 一抬手就急刹（上一版踩的坑）。
-        @try {
-            double raw = [[self valueForKey:@"_verticalVelocity"] doubleValue];
-            double v = fabs(raw);
-            if (v < kAutoNativeStopV) {
-                // 已慢到不值得续（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
-                [self stopAutoNative];
-                return;
-            }
-            if (v < 1.0) {
-                // 第一次钉之前记下系统原值，停止时恢复（保证松手后的手动滑手感不变）
-                if (!objc_getAssociatedObject(self, kOrigFactorKey)) {
-                    objc_setAssociatedObject(self, kOrigFactorKey,
-                                             [self valueForKey:@"_decelerationFactor"],
-                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                }
-                // 方向跟随当前速度；大小钉到 pxcex 的巡航值
-                double sign = (raw < 0.0) ? -1.0 : 1.0;
-                [self setValue:@(kAutoNativeHoldFactor) forKey:@"_decelerationFactor"];
-                [self setValue:@(kAutoNativeHoldFactor * sign) forKey:@"_verticalVelocity"];
-            }
-        } @catch (NSException *e) {
-            nativeSustainBroken = YES;  // 私有 ivar 不存在（iOS 版本变了）-> 退回自有驱动
+        // 速度自然衰减进 [0.1, 1.0)（100~1000pt/s）后，把 factor 钉在 ≈1.0 防止动画提前结束，
+        // 并把 velocity 钉回当前量级（不让系统继续衰减）。方向始终跟随原速度。
+        // 关键：两个都要写。只写 factor 不重写 velocity => 每帧速度继续按原厂比例衰减，
+        // 配合被钉死的大 factor 会提前进入低速区 => 一抬手就急刹（上一版踩的坑）。
+        // 读写全部走直接内存（usc_ivarPtr），不走 KVC —— KVC 会被私有 setter 拦截。
+        double *velPtr = usc_ivarPtr(self, "_verticalVelocity");
+        double *facPtr = usc_ivarPtr(self, "_decelerationFactor");
+        if (!velPtr || !facPtr) {
+            // 私有 ivar 不存在（iOS 版本变了）-> 退回自有驱动
+            nativeSustainBroken = YES;
             [self stopAutoNative];
             [self startUIScroller];
             return;
+        }
+        double raw = *velPtr;
+        double v = fabs(raw);
+        if (v < kAutoNativeStopV) {
+            // 已慢到不值得续（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
+            [self stopAutoNative];
+            return;
+        }
+        if (v < 1.0) {
+            // 第一次钉之前记下系统原值，停止时恢复（保证松手后的手动滑手感不变）
+            if (!objc_getAssociatedObject(self, kOrigFactorKey)) {
+                objc_setAssociatedObject(self, kOrigFactorKey,
+                                         [NSNumber numberWithDouble:*facPtr],
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            // 钉值 = pxcex 反汇编逐字对应的公式；速度方向跟随原值
+            double sign = (raw < 0.0) ? -1.0 : 1.0;
+            double pin  = (double)(float)(kAutoNativePinBase + v * kAutoNativePinEps);
+            *facPtr = pin;
+            *velPtr = pin * sign;
         }
     }
 
