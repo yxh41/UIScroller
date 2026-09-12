@@ -17,6 +17,7 @@
 - (void)setupAutoDisableTimer;
 - (void)attachStopTouchGesture;
 - (void)detachStopTouchGesture;
+- (void)forceLayoutVisibleCells;
 @end
 
 // CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
