@@ -673,6 +673,15 @@ void openSimpleMenu() {
     }
 
     %new
+    - (void)forceLayoutVisibleCells {
+        // 直接写 contentOffset 后，UITableView / UICollectionView 的可见单元格下一次布局会被
+        // runloop 合并/推迟，要等手指碰一下触发 layoutSubviews 才补齐 —— 表现就是"界面空白、
+        // 碰一下才出内容"。这里同步强制一次布局，让新位置上的单元格立刻被创建/定位。
+        [self setNeedsLayout];
+        [self layoutIfNeeded];
+    }
+
+    %new
     - (void)autoScroll {
         // ── 交接观察期（仅自动档）──
         // 让系统自带减速先跑 1~2 帧，用"实测位移 / 实测时间"算出它真实的滚动速度再接手，
@@ -809,6 +818,7 @@ void openSimpleMenu() {
             CGPoint edge = self.contentOffset;
             edge.y = (targetY >= maxOffset) ? maxOffset : minOffset;
             [self setContentOffset:edge animated:NO];
+            [self forceLayoutVisibleCells];
             objc_setAssociatedObject(self, kExpectedOffsetKey, @(edge.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kExpectedSetKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             return;
@@ -817,6 +827,7 @@ void openSimpleMenu() {
         CGPoint offset = self.contentOffset;
         offset.y = targetY;
         [self setContentOffset:offset animated:NO];
+        [self forceLayoutVisibleCells];
         // 记下"我们写进去的值"，下一帧用来判断 App 有没有偷偷改过 offset
         objc_setAssociatedObject(self, kExpectedOffsetKey, @(targetY), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kExpectedSetKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -896,7 +907,9 @@ void openSimpleMenu() {
         if (grew) return;
 
         if (!nativeSustainBroken) {
-            // 私有 API 续不动：本进程改用我们自己的驱动，从当前巡航速度接管
+            // 原生续滚失效（私有 API 不可用 / 真的到底）：本进程改用我们自己的 CADisplayLink 驱动，
+            // 从当前巡航速度无缝接管。空白问题已由 forceLayoutVisibleCells 在每次写 offset 后
+            // 同步强制布局解决，所以回退路径不会再出现"碰一下才出内容"。
             nativeSustainBroken = YES;
             objc_setAssociatedObject(self, kDragVelocityKey, @(cruise), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [self stopAutoNative];
