@@ -18,11 +18,8 @@
 - (void)attachStopTouchGesture;
 - (void)detachStopTouchGesture;
 - (void)forceLayoutVisibleCells;
-- (void)scheduleEdgeResume;
-- (void)cancelEdgeResume;
 - (void)applyKeepAwakeIfEnabled;
 - (void)restoreKeepAwake;
-- (void)simulateEdgePull;
 @end
 
 @interface UIWindow (UIScroller)
@@ -72,13 +69,11 @@ static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 // ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
 static const void *kAutoActiveKey       = &kAutoActiveKey;
 static const void *kCornerGestureKey    = &kCornerGestureKey;
-static const void *kEdgeResumeTimerKey  = &kEdgeResumeTimerKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
 static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
 static const void *kAutoLastYKey        = &kAutoLastYKey;
 static const void *kAutoLastTKey        = &kAutoLastTKey;
 static const void *kAutoStallKey        = &kAutoStallKey;
-static const void *kAutoLastCsKey       = &kAutoLastCsKey;
 static const void *kOrigFactorKey       = &kOrigFactorKey;
 // 私有 API（_verticalVelocity）维持无效时置 YES：本进程内自动档退回我们自己的驱动
 static BOOL nativeSustainBroken = NO;
@@ -139,10 +134,10 @@ static double *usc_ivarPtr(id obj, const char *name) {
     if (!iv) return NULL;
     return (double *)((char *)(__bridge void *)obj + ivar_getOffset(iv));
 }
-// 滚到内容尽头后的"贴边等待"时长（秒）：期间保持贴在边界上唤起 App 的加载更多，
-// 等到新内容就继续滚；超时说明真到底了才停。微信分段加载消息实测加载圈常转 3~5s，
-// 3s 太短会"圈没转完就停"，放宽到 6s；真到底时贴边 6s 略久，但按一下屏幕随时可停。
-static const CFTimeInterval kEdgeWaitTimeout = 6.0;
+// 滚到内容尽头后贴边的时长（秒）：钉在边界上滑不动就停，别一直较劲。
+// QQ/微信的懒加载不认程序化信号（只认真实手指回拉），贴边等待已验证无意义，
+// 这里只留 1 秒缓冲避免"撞墙急停"的手感；到点交还系统自然滑停。
+static const CFTimeInterval kEdgeWaitTimeout = 1.0;
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
@@ -625,8 +620,6 @@ void openSimpleMenu() {
     // Telegram 的位置补偿等全部照常工作（对 App 来说就是"一次很长的减速"），兼容性最好。
     %new
     - (void)startAutoNative {
-        // 新一轮接管：取消上一轮挂着的"贴边等新内容"watcher，避免两套驱动互相踩
-        [self cancelEdgeResume];
         // 屏幕常亮必须两条驱动路径都生效：原生续滚不走 startUIScroller，
         // 之前只在那里设置，微信里"力道滑动开了常亮照样锁屏"就是漏了这里
         [self applyKeepAwakeIfEnabled];
@@ -634,7 +627,6 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastCsKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
@@ -676,74 +668,6 @@ void openSimpleMenu() {
             objc_setAssociatedObject(self, kIdleTimerSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kIdleTimerPrevKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
-    }
-
-    %new
-    - (void)cancelEdgeResume {
-        NSTimer *t = objc_getAssociatedObject(self, kEdgeResumeTimerKey);
-        if (t) {
-            [t invalidate];
-            objc_setAssociatedObject(self, kEdgeResumeTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
-    }
-
-    %new
-    - (void)scheduleEdgeResume {
-        [self cancelEdgeResume];
-        // 贴边等满后进入"等新内容"状态：盯住 contentSize，App 一插入新内容
-        // 就用自有驱动（startUIScroller）接着巡航，用户无感知；等到超时/用户
-        // 手指按上（isTracking）就放弃，回归普通滚动。
-        CGFloat baseCs = self.contentSize.height;
-        __weak typeof(self) weakSelf = self;
-        CFTimeInterval deadline = CACurrentMediaTime() + kEdgeWaitTimeout;
-        CFTimeInterval started  = CACurrentMediaTime();
-        __block BOOL pullTried = NO;
-        NSTimer *t = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf) { [timer invalidate]; return; }
-            if (strongSelf.isTracking || CACurrentMediaTime() > deadline) {
-                [strongSelf cancelEdgeResume];
-                return;
-            }
-            // 等 1.5s 还没动静：拉一次（模拟手指拉进回弹区再松手）——
-            // QQ 这类"拉起来才加载"的控件认的是 overscroll+松手，不认顶在边界干等
-            if (!pullTried && CACurrentMediaTime() - started > 1.5) {
-                pullTried = YES;
-                [strongSelf simulateEdgePull];
-            }
-            if (fabs(strongSelf.contentSize.height - baseCs) > 0.5) {
-                [strongSelf cancelEdgeResume];
-                [strongSelf startUIScroller];   // 新内容到位，接着按原力道巡航
-            }
-        }];
-        [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
-        objc_setAssociatedObject(self, kEdgeResumeTimerKey, t, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-
-    %new
-    - (void)simulateEdgePull {
-        // 模拟"拉起来再松手"：QQ 等应用的加载历史由 overscroll 回弹触发，
-        // 纯顶在边界不进回弹区，拉载控件收不到"拉了又放"的信号。
-        // 程序化写 offset 可以越过边界（显示为拉进回弹区的位置），再放回来。
-        UIEdgeInsets insets = self.adjustedContentInset;
-        CGFloat minO = -insets.top;
-        CGFloat maxO = MAX(minO, self.contentSize.height + insets.bottom - CGRectGetHeight(self.bounds));
-        CGPoint cur = self.contentOffset;
-        CGPoint edge = cur, over = cur;
-        if (fabs(cur.y - minO) <= fabs(cur.y - maxO)) { edge.y = minO; over.y = minO - 60.0; }
-        else                                          { edge.y = maxO; over.y = maxO + 60.0; }
-        __weak typeof(self) weakSelf = self;
-        [UIView animateWithDuration:0.30 animations:^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (strongSelf) [strongSelf setContentOffset:over animated:NO];
-        }];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            __strong typeof(weakSelf) strongSelf = weakSelf;
-            if (!strongSelf || strongSelf.isTracking) return;
-            [UIView animateWithDuration:0.25 animations:^{
-                [strongSelf setContentOffset:edge animated:NO];
-            }];
-        });
     }
 
     %new
@@ -1058,30 +982,20 @@ void openSimpleMenu() {
             [self startUIScroller];
             return;
         }
-        // 贴边检测：offset 连续 kEdgeWaitTimeout 秒没动 = 内容真到底了，
-        // 别再顶着边界较劲（也避免加载更多失败时永远停不下来），交还系统。
-        // 例外：等待期间 contentSize 变了 = App 的加载真的插入了新内容，
-        // 重置等待计时继续滚 —— 微信分段加载消息"圈转几秒才出内容"靠这条续上。
+        // 贴边检测：offset 连续 kEdgeWaitTimeout(1s) 秒没动 = 顶到内容尽头，
+        // 别再顶着边界较劲，把速度归零交还系统自然滑停。
+        // （贴边等待/模拟回拉已验证无意义并移除：QQ/微信的懒加载只认真实手指回拉，
+        // 程序化信号一概不认。velPtr=0 让动画自然结束，保住 didEndDecelerating 回调。）
         CGFloat y = self.contentOffset.y;
         CGFloat lastY = [objc_getAssociatedObject(self, kAutoLastYKey) doubleValue];
         CFTimeInterval lastT = [objc_getAssociatedObject(self, kAutoLastTKey) doubleValue];
         CFTimeInterval now = CACurrentMediaTime();
-        CGFloat csH = self.contentSize.height;
-        CGFloat lastCs = [objc_getAssociatedObject(self, kAutoLastCsKey) doubleValue];
-        BOOL contentChanged = lastCs > 0.0 && fabs(csH - lastCs) > 0.5;
-        if (fabs(y - lastY) > 0.5 || contentChanged) {
+        if (fabs(y - lastY) > 0.5) {
             objc_setAssociatedObject(self, kAutoLastYKey, @(y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kAutoLastCsKey, @(csH), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         } else if (lastT > 0.0 && now - lastT > kEdgeWaitTimeout) {
-            // 贴边等满仍无新内容：把速度归零，让减速动画自己走到结束 —— App 收到
-            // scrollViewDidEndDecelerating。很多懒加载挂在这个"滑完了"回调上，
-            // 原生续滚的动画一直不结束，App 就永远不触发加载（手动滑完立即出的原因）。
-            // 注意不要用 setContentOffset:animated:NO 强停：那样可能吞掉 didEndDecelerating，
-            // QQ 上"动画停了加载还是不来"就是这个问题。
             *velPtr = 0.0;
             [self stopAutoNative];
-            [self scheduleEdgeResume];   // 盯住 contentSize + 模拟回拉，新内容一到自动续上巡航
             return;
         }
         double raw = *velPtr;
