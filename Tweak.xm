@@ -71,6 +71,8 @@ static const void *kAutoActiveKey       = &kAutoActiveKey;
 static const void *kCornerGestureKey    = &kCornerGestureKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
 static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
+static const void *kAutoLastYKey        = &kAutoLastYKey;
+static const void *kAutoLastTKey        = &kAutoLastTKey;
 static const void *kAutoStallKey        = &kAutoStallKey;
 static const void *kOrigFactorKey       = &kOrigFactorKey;
 // 私有 API（_verticalVelocity）维持无效时置 YES：本进程内自动档退回我们自己的驱动
@@ -155,6 +157,11 @@ static inline double *usc_facPtr(id obj) {
 // （滚到尽头再等一会儿唤起加载更多）。自动档的原生续滚已按用户要求去掉贴边行为
 // —— 顶到内容尽头就一直贴着，直到用户触摸停止或定时自动关（pxcex 行为）。
 static const CFTimeInterval kEdgeWaitTimeout = 1.0;
+// 贴边即停：offset 连续这么久没动就交还系统（秒）。
+// 用户确认不要"顶着等"：滚不动就立刻停。留 0.3s 只是为了排除单帧卡顿/取整导致的误判，
+// 0.3s 之外没有可感知的顶边时间。注意它和固定挡回退路径的 kEdgeWaitTimeout 是两回事。
+static const CFTimeInterval kEdgeStallTime = 0.3;
+
 // 自动档的甩动触发阈值（pt/s）：故意比固定挡的 700 低很多——
 // 轻轻一甩也会自动延续，且滚动速度完全跟随力道（甩得快滚得快、甩得慢滚得慢，pxcex 行为）。
 // 拉低后不必担心误触：微信下拉面板/滚轮/回弹区仍由各自的守卫拦住。
@@ -642,6 +649,8 @@ void openSimpleMenu() {
         [self applyKeepAwakeIfEnabled];
         // 记录续滚起点：贴边检测基准（offset + 时刻）配合 kAutoV0Key（松手实测速度）恒速续滚
         objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
@@ -1007,6 +1016,20 @@ void openSimpleMenu() {
         }
         double raw = *velPtr;
         double v = fabs(raw);
+        // 贴边即停：offset 连续 kEdgeStallTime 没动 = 滚不动了，速度归零交还系统自然滑停。
+        // （用户确认不要"顶着等"：贴边等待已验证对 QQ/微信的懒加载无效。）
+        CGFloat y = self.contentOffset.y;
+        CGFloat lastY = [objc_getAssociatedObject(self, kAutoLastYKey) doubleValue];
+        CFTimeInterval lastT = [objc_getAssociatedObject(self, kAutoLastTKey) doubleValue];
+        CFTimeInterval now = CACurrentMediaTime();
+        if (fabs(y - lastY) > 0.5) {
+            objc_setAssociatedObject(self, kAutoLastYKey, @(y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } else if (lastT > 0.0 && now - lastT > kEdgeStallTime) {
+            *velPtr = 0.0;
+            [self stopAutoNative];
+            return;
+        }
         // 恒速目标：松手瞬间 pan 手势的实测速度（pt/s，接管入口存好），换算 pt/ms 并封顶
         double v0ptps = [objc_getAssociatedObject(self, kAutoV0Key) doubleValue];
         double target = MIN(v0ptps / 1000.0, kAutoNativeCruiseMaxV);
