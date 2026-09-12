@@ -67,7 +67,7 @@ static const void *kAutoLastYKey        = &kAutoLastYKey;
 static const void *kAutoLastTKey        = &kAutoLastTKey;
 static const void *kAutoStallKey        = &kAutoStallKey;
 static const void *kAutoLastCsKey       = &kAutoLastCsKey;
-static const void *kAutoLastVKey        = &kAutoLastVKey;
+static const void *kOrigFactorKey       = &kOrigFactorKey;
 // 私有 API（_verticalVelocity）维持无效时置 YES：本进程内自动档退回我们自己的驱动
 static BOOL nativeSustainBroken = NO;
 
@@ -101,13 +101,16 @@ static const CFTimeInterval kAutoDecayTau = 8.0;
 // 实测交接速度的合理上限（pt/s）：超过就认为观察窗口被 App 自己的 offset 变动污染了，
 // 回退用松手速度。否则会拿到离谱的速度直接冲到内容边界（表现为"瞬间到顶部"）。
 static const float kAutoVelocitySanity = 4000.0f;
-// 停止阈值（pt/s）：衰减到该速度以下结束驱动（已慢到看不出在动）。
+// 停止阈值（pt/s）：衰减到该速度以下结束驱动（已慢到看不出在动）。[CADisplayLink 回退驱动用]
 static const float kAutoStopSpeed = 20.0f;
-// 速度棘轮（原生续滚）：系统每帧衰减后的速度允许保留的下限比例。
-// 只钳"衰减率"、从不向上顶速度 —— 任何时刻列表承受的速度都不超过 fling 期间
-// 它已经在正常消化的速度，单元格/估算行高就不会被冲进来不及物化的区域（空白）。
-// 0.998/帧 @60Hz ≈ 每秒保留 88%：1500pt/s 的甩动力道 10 秒后还剩约 500，尾感自然。
-static const double kAutoHoldKeepRatio = 0.998;
+// ── 原生续滚（pxcex 同款算法，常量取自其 dylib 反汇编）──
+// 单位关键知识：UIScrollView 私有 ivar _verticalVelocity 的单位是 pt/ms
+// （0.1~1.0 pt/ms ≈ 100~1000 pt/s，正是普通甩动的收尾速度段）。
+// 收尾区间下限：|v| < 0.1 pt/ms（<100pt/s）不再钉系数，交还系统自然滑停。
+static const double kAutoNativeStopV = 0.1;
+// 钉住的衰减系数（float 1.0 以下最近值）：≈1 => 系统几乎不减速，
+// 以"进入收尾区间那一刻自己的速度"近乎匀速滑下去。全程不注入速度 => 永不空白。
+static const double kAutoNativeHoldFactor = 0.9999994;
 // 滚到内容尽头后的"贴边等待"时长（秒）：期间保持贴在边界上唤起 App 的加载更多，
 // 等到新内容就继续滚；超时说明真到底了才停。太长会觉得"卡住"，太短来不及触发加载。
 static const CFTimeInterval kEdgeWaitTimeout = 3.0;
@@ -542,12 +545,6 @@ void openSimpleMenu() {
     %new
     - (void)startAutoNative {
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoStallKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastCsKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastVKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
     }
@@ -555,6 +552,12 @@ void openSimpleMenu() {
     %new
     - (void)stopAutoNative {
         objc_setAssociatedObject(self, kAutoActiveKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 恢复被钉住的衰减系数，否则下一次手指拖拽几乎不减速（手感被破坏）
+        NSNumber *origFactor = objc_getAssociatedObject(self, kOrigFactorKey);
+        if (origFactor) {
+            objc_setAssociatedObject(self, kOrigFactorKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            @try { [self setValue:origFactor forKey:@"_decelerationFactor"]; } @catch (NSException *e) {}
+        }
         [self detachStopTouchGesture];
         [self stopAutoDisableTimer];
     }
@@ -866,81 +869,33 @@ void openSimpleMenu() {
         %orig(time);
         if (![objc_getAssociatedObject(self, kAutoActiveKey) boolValue]) return;
 
-        CFTimeInterval now = CACurrentMediaTime();
-
-        // ── 速度棘轮（关键：绝不向上顶速度）──
-        // 旧版把 _verticalVelocity 每帧硬顶到由手指松手速度算出的 cruise（上限 3000pt/s），
-        // 远超系统减速动画实际在用的速度 -> 列表被推进到单元格/估算行高来不及物化的区域，
-        // 表现为"滚着滚着空白，碰一下屏幕内容才出现"。pxcex 不注入自己的速度所以不空白。
-        // 现在只读系统当前速度，只钳制衰减率、永不加速：任何时刻的速度都不超过
-        // fling 期间 App 已在正常消化的速度，内容加载完全跟得上。
-        double cv = 0.0;
+        // ── pxcex 同款算法（常量取自其 dylib 反汇编）：只钉衰减系数，绝不注入速度 ──
+        // _verticalVelocity 单位是 pt/ms。快段（≥1.0，>1000pt/s）完全不动，让系统自然衰减
+        // ——任何时刻的速度都是系统自己的值，App 的单元格/估算行高渲染毫无压力（不空白的根本原因）。
+        // 速度自然衰减进 100~1000pt/s 收尾区间后，把 _decelerationFactor 钉在 ≈1.0，
+        // 系统就以"当时自己的速度"近乎匀速滑下去：你快它快、你慢它慢，直到手动停/内容到头。
         @try {
-            cv = [[self valueForKey:@"_verticalVelocity"] doubleValue];
-        } @catch (NSException *e) {
-            nativeSustainBroken = YES;  // 私有变量不存在（iOS 版本变了）-> 退回自有驱动
-            [self stopAutoNative];
-            [self startUIScroller];
-            return;
-        }
-        // 衰减系数单独兜底：个别版本若没有该 ivar，只影响"抬系数"这一优化，不影响续滚本身
-        @try {
-            double df = [[self valueForKey:@"_decelerationFactor"] doubleValue];
-            if (df > 0.0 && df < kAutoHoldKeepRatio) {
-                [self setValue:@(kAutoHoldKeepRatio) forKey:@"_decelerationFactor"];
+            double v = fabs([[self valueForKey:@"_verticalVelocity"] doubleValue]);
+            if (v < kAutoNativeStopV) {
+                // 已慢到不值得续（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
+                [self stopAutoNative];
+                return;
             }
-        } @catch (NSException *e) { /* 没有 _decelerationFactor 就只靠速度棘轮 */ }
-        if (fabs(cv) < kAutoStopSpeed) { [self stopAutoNative]; return; }
-
-        double lastV = [objc_getAssociatedObject(self, kAutoLastVKey) doubleValue];
-        objc_setAssociatedObject(self, kAutoLastVKey, @(cv), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (lastV > 1.0 && fabs(cv) < fabs(lastV) * kAutoHoldKeepRatio) {
-            // 系统衰减太快 -> 把速度钳回上一帧的 99.8%（保持原方向，只减不增）
-            double sign = (cv > 0.0) ? 1.0 : -1.0;
-            @try {
-                [self setValue:@(fabs(lastV) * kAutoHoldKeepRatio * sign) forKey:@"_verticalVelocity"];
-            } @catch (NSException *e) { /* 写失败极罕见，下一帧重试 */ }
-        }
-
-        // 进度检测：实际位移远小于预期 => 到底/到顶，或维持手段无效
-        double lastY = [objc_getAssociatedObject(self, kAutoLastYKey) doubleValue];
-        double lastT = [objc_getAssociatedObject(self, kAutoLastTKey) doubleValue];
-        double dt = now - lastT;
-        double dy = fabs(self.contentOffset.y - lastY);
-        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (dt <= 0.0) return;
-
-        double stall = [objc_getAssociatedObject(self, kAutoStallKey) doubleValue];
-        if (dy < fabs(cv) * dt * 0.3) stall += dt; else stall = 0.0;
-        objc_setAssociatedObject(self, kAutoStallKey, @(stall), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (stall <= 0.4) return;
-
-        // 内容变高了 = 懒加载出新内容 -> 再等等；否则判定停住
-        double lastCs = [objc_getAssociatedObject(self, kAutoLastCsKey) doubleValue];
-        BOOL grew = (self.contentSize.height - lastCs) > 1.0;
-        objc_setAssociatedObject(self, kAutoLastCsKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoStallKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (grew) return;
-
-        if (!nativeSustainBroken) {
-            // 原生续滚失效（系统动画停了/真的到底）：本进程改用我们自己的 CADisplayLink 驱动，
-            // 从当前速度无缝接管（forceLayoutVisibleCells 已保证该路径不空白）。
-            nativeSustainBroken = YES;
-            objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(cv)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (v < 1.0) {
+                // 第一次钉之前记下系统原值，停止时恢复（保证松手后的手动滑手感不变）
+                if (!objc_getAssociatedObject(self, kOrigFactorKey)) {
+                    objc_setAssociatedObject(self, kOrigFactorKey,
+                                             [self valueForKey:@"_decelerationFactor"],
+                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                [self setValue:@(kAutoNativeHoldFactor) forKey:@"_decelerationFactor"];
+            }
+        } @catch (NSException *e) {
+            nativeSustainBroken = YES;  // 私有 ivar 不存在（iOS 版本变了）-> 退回自有驱动
             [self stopAutoNative];
             [self startUIScroller];
-            objc_setAssociatedObject(self, kHandoffKey, @(0), OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 已在动，跳过交接测速
-            objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kScrollStartKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kExpectedSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             return;
         }
-        [self stopAutoNative];
     }
 
 %end
