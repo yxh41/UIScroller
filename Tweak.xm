@@ -20,6 +20,9 @@
 - (void)forceLayoutVisibleCells;
 - (void)scheduleEdgeResume;
 - (void)cancelEdgeResume;
+- (void)applyKeepAwakeIfEnabled;
+- (void)restoreKeepAwake;
+- (void)simulateEdgePull;
 @end
 
 @interface UIWindow (UIScroller)
@@ -624,6 +627,9 @@ void openSimpleMenu() {
     - (void)startAutoNative {
         // 新一轮接管：取消上一轮挂着的"贴边等新内容"watcher，避免两套驱动互相踩
         [self cancelEdgeResume];
+        // 屏幕常亮必须两条驱动路径都生效：原生续滚不走 startUIScroller，
+        // 之前只在那里设置，微信里"力道滑动开了常亮照样锁屏"就是漏了这里
+        [self applyKeepAwakeIfEnabled];
         // 记录续滚起点：贴边检测基准（offset + 时刻）配合 kAutoV0Key（松手实测速度）恒速续滚
         objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -647,6 +653,29 @@ void openSimpleMenu() {
         }
         [self detachStopTouchGesture];
         [self stopAutoDisableTimer];
+        [self restoreKeepAwake];
+    }
+
+    %new
+    - (void)applyKeepAwakeIfEnabled {
+        if (!keepScreenAwake) return;
+        UIApplication *app = [UIApplication sharedApplication];
+        // 先记下 App 原本的息屏策略，停止滚动时还原 —— 不能无脑设 NO，
+        // 否则会把视频/导航类 App 本来就该常亮的状态给关掉。
+        objc_setAssociatedObject(self, kIdleTimerPrevKey, @(app.idleTimerDisabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kIdleTimerSetKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        app.idleTimerDisabled = YES;
+    }
+
+    %new
+    - (void)restoreKeepAwake {
+        // 还原 App 原本的息屏策略（仅当我们改过时才还原）
+        if ([objc_getAssociatedObject(self, kIdleTimerSetKey) boolValue]) {
+            BOOL prev = [objc_getAssociatedObject(self, kIdleTimerPrevKey) boolValue];
+            [UIApplication sharedApplication].idleTimerDisabled = prev;
+            objc_setAssociatedObject(self, kIdleTimerSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kIdleTimerPrevKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
     }
 
     %new
@@ -667,12 +696,20 @@ void openSimpleMenu() {
         CGFloat baseCs = self.contentSize.height;
         __weak typeof(self) weakSelf = self;
         CFTimeInterval deadline = CACurrentMediaTime() + kEdgeWaitTimeout;
+        CFTimeInterval started  = CACurrentMediaTime();
+        __block BOOL pullTried = NO;
         NSTimer *t = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) { [timer invalidate]; return; }
             if (strongSelf.isTracking || CACurrentMediaTime() > deadline) {
                 [strongSelf cancelEdgeResume];
                 return;
+            }
+            // 等 1.5s 还没动静：拉一次（模拟手指拉进回弹区再松手）——
+            // QQ 这类"拉起来才加载"的控件认的是 overscroll+松手，不认顶在边界干等
+            if (!pullTried && CACurrentMediaTime() - started > 1.5) {
+                pullTried = YES;
+                [strongSelf simulateEdgePull];
             }
             if (fabs(strongSelf.contentSize.height - baseCs) > 0.5) {
                 [strongSelf cancelEdgeResume];
@@ -681,6 +718,32 @@ void openSimpleMenu() {
         }];
         [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
         objc_setAssociatedObject(self, kEdgeResumeTimerKey, t, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    %new
+    - (void)simulateEdgePull {
+        // 模拟"拉起来再松手"：QQ 等应用的加载历史由 overscroll 回弹触发，
+        // 纯顶在边界不进回弹区，拉载控件收不到"拉了又放"的信号。
+        // 程序化写 offset 可以越过边界（显示为拉进回弹区的位置），再放回来。
+        UIEdgeInsets insets = self.adjustedContentInset;
+        CGFloat minO = -insets.top;
+        CGFloat maxO = MAX(minO, self.contentSize.height + insets.bottom - CGRectGetHeight(self.bounds));
+        CGPoint cur = self.contentOffset;
+        CGPoint edge = cur, over = cur;
+        if (fabs(cur.y - minO) <= fabs(cur.y - maxO)) { edge.y = minO; over.y = minO - 60.0; }
+        else                                          { edge.y = maxO; over.y = maxO + 60.0; }
+        __weak typeof(self) weakSelf = self;
+        [UIView animateWithDuration:0.30 animations:^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf) [strongSelf setContentOffset:over animated:NO];
+        }];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf || strongSelf.isTracking) return;
+            [UIView animateWithDuration:0.25 animations:^{
+                [strongSelf setContentOffset:edge animated:NO];
+            }];
+        });
     }
 
     %new
@@ -736,14 +799,7 @@ void openSimpleMenu() {
 
         // 屏幕常亮（菜单开关，默认关）：程序化滚动不算用户操作，系统照常息屏锁屏，
         // 开着它才能在长时间自动滚动时保持亮屏。
-        if (keepScreenAwake) {
-            UIApplication *app = [UIApplication sharedApplication];
-            // 先记下 App 原本的息屏策略，停止滚动时还原 —— 不能无脑设 NO，
-            // 否则会把视频/导航类 App 本来就该常亮的状态给关掉。
-            objc_setAssociatedObject(self, kIdleTimerPrevKey, @(app.idleTimerDisabled), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kIdleTimerSetKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            app.idleTimerDisabled = YES;
-        }
+        [self applyKeepAwakeIfEnabled];
 
         if (autoDisableMinutes > 0) {
             [self stopAutoDisableTimer];
@@ -774,12 +830,7 @@ void openSimpleMenu() {
         // 手动停了滚动就把"自动停止"计时器一并清掉，否则到点还会莫名弹提示
         [self stopAutoDisableTimer];
         // 还原 App 原本的息屏策略（仅当我们改过时才还原）
-        if ([objc_getAssociatedObject(self, kIdleTimerSetKey) boolValue]) {
-            BOOL prev = [objc_getAssociatedObject(self, kIdleTimerPrevKey) boolValue];
-            [UIApplication sharedApplication].idleTimerDisabled = prev;
-            objc_setAssociatedObject(self, kIdleTimerSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kIdleTimerPrevKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
+        [self restoreKeepAwake];
         [self detachStopTouchGesture];
     }
 
@@ -1023,13 +1074,14 @@ void openSimpleMenu() {
             objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kAutoLastCsKey, @(csH), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         } else if (lastT > 0.0 && now - lastT > kEdgeWaitTimeout) {
-            // 贴边等满仍无新内容：把速度归零并停掉减速动画 —— 让 App 收到
-            // scrollViewDidEndDecelerating。很多懒加载挂在这个"滑完了"的回调上，
+            // 贴边等满仍无新内容：把速度归零，让减速动画自己走到结束 —— App 收到
+            // scrollViewDidEndDecelerating。很多懒加载挂在这个"滑完了"回调上，
             // 原生续滚的动画一直不结束，App 就永远不触发加载（手动滑完立即出的原因）。
+            // 注意不要用 setContentOffset:animated:NO 强停：那样可能吞掉 didEndDecelerating，
+            // QQ 上"动画停了加载还是不来"就是这个问题。
             *velPtr = 0.0;
             [self stopAutoNative];
-            [self setContentOffset:self.contentOffset animated:NO];  // 确保减速动画立刻终止
-            [self scheduleEdgeResume];   // 盯住 contentSize，新内容一到自动续上巡航
+            [self scheduleEdgeResume];   // 盯住 contentSize + 模拟回拉，新内容一到自动续上巡航
             return;
         }
         double raw = *velPtr;
