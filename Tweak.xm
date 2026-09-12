@@ -115,6 +115,9 @@ static const double kAutoNativeStopV = 0.1;
 // ≈1 => 系统几乎不减速，以"进入收尾区间那一刻自己的速度"近乎匀速滑下去。
 static const double kAutoNativePinBase = 0.9999994039535522;
 static const double kAutoNativePinEps  = 5.364418e-07;
+// 续滚巡航上限（pt/ms）：再快就写入超出甩动正常量级的速度，列表来不及物化单元格会空白。
+// 1.0 pt/ms = 1000pt/s = pxcex 反汇编里收尾区间的上限，重甩到这个量级后就从 1000 缓收。
+static const double kAutoNativeCruiseMaxV = 1.0;
 
 // 关键差异（血泪教训）：不能用 KVC（setValue:forKey:）写这两个私有 ivar ——
 // UIScrollView 的私有 setter 会拦截/钳制写入，表现为"自动档没作用"或"急刹"。
@@ -557,6 +560,8 @@ void openSimpleMenu() {
     // Telegram 的位置补偿等全部照常工作（对 App 来说就是"一次很长的减速"），兼容性最好。
     %new
     - (void)startAutoNative {
+        // 记录续滚起点时刻：配合 kAutoV0Key（松手实测速度）算收尾曲线
+        objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
@@ -884,13 +889,12 @@ void openSimpleMenu() {
         %orig(time);
         if (![objc_getAssociatedObject(self, kAutoActiveKey) boolValue]) return;
 
-        // ── pxcex 同款（反汇编实证）：每帧只钉 factor，从不写 velocity ──
-        // _verticalVelocity 单位 pt/ms。快段（≥1.0，>1000pt/s）完全不动，任由系统自然衰减
-        // ——App 的单元格/估算行高渲染毫无压力（不空白的根本原因）。
-        // 速度自然衰减进 [0.1, 1.0)（100~1000pt/s）后，把 factor 钉在 ≈1.0（每帧乘数≈1，
-        // 速度不再衰减）——速度就停在进入区间那一刻的值 => 甩多重就滚多快，跟随力道。
-        // 血泪教训：如果把 velocity 也每帧写回 ≈1.0pt/ms，速度会被钳死在 ~1000pt/s，
-        // 无论甩多轻都一样快（上一版真机实测）。只写 factor，velocity 交给系统。
+        // ── 力道跟随续滚：velocity 是驱动本体，必须写；factor 只是辅助 ──
+        // 真机实测矩阵：只钉 factor（a4d7758）= velocity 照常自然衰减 = 完全没效果；
+        // factor+velocity 每帧写死 ≈1.0pt/ms（40d3e05）= 能续住但速度钳死 ~1000pt/s，不跟力道。
+        // 结论：_verticalVelocity 才是滚动驱动变量（写多大滚多快），factor≈1 只防动画提前结束。
+        // 正解：每帧把 velocity 续回"松手实测速度的缓慢收尾曲线" v(t) = min(v0,1.0pt/ms)·e^(-t/8s)。
+        // 轻甩慢滚、重甩快滚（跟随力道）；写入量级 ≤ 甩动本身的速度，App 本来就在消化这个量级，不空白。
         // 读写全部走直接内存（usc_ivarPtr），不走 KVC —— KVC 会被私有 setter 拦截。
         double *velPtr = usc_ivarPtr(self, "_verticalVelocity");
         double *facPtr = usc_ivarPtr(self, "_decelerationFactor");
@@ -903,21 +907,24 @@ void openSimpleMenu() {
         }
         double raw = *velPtr;
         double v = fabs(raw);
-        if (v < kAutoNativeStopV) {
-            // 已慢到不值得续（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
+        // v0：松手瞬间 pan 手势的实测速度（pt/s，接管入口存好），换算成 pt/ms 并封顶
+        double v0ptps = [objc_getAssociatedObject(self, kAutoV0Key) doubleValue];
+        double t0     = [objc_getAssociatedObject(self, kAutoStartTimeKey) doubleValue];
+        double target = MIN(v0ptps / 1000.0, kAutoNativeCruiseMaxV) * exp((CACurrentMediaTime() - t0) / -kAutoDecayTau);
+        if (target < kAutoNativeStopV) {
+            // 曲线已收完（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
             [self stopAutoNative];
             return;
         }
-        if (v < 1.0) {
-            // 第一次钉之前记下系统原值，停止时恢复（保证松手后的手动滑手感不变）
-            if (!objc_getAssociatedObject(self, kOrigFactorKey)) {
-                objc_setAssociatedObject(self, kOrigFactorKey,
-                                         [NSNumber numberWithDouble:*facPtr],
-                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            }
-            // 钉值 = pxcex 反汇编逐字对应的公式；velocity 一概不碰
-            *facPtr = (double)(float)(kAutoNativePinBase + v * kAutoNativePinEps);
+        if (v >= target) return;   // 系统速度仍在曲线上方（刚松手的快段）：不干预，任其自然衰减
+        // 系统自然衰减（~21%/s）快于曲线（~12.5%/s），掉到曲线下方就把速度续回曲线上
+        if (!objc_getAssociatedObject(self, kOrigFactorKey)) {
+            objc_setAssociatedObject(self, kOrigFactorKey,
+                                     [NSNumber numberWithDouble:*facPtr],
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
+        *facPtr = (double)(float)(kAutoNativePinBase + target * kAutoNativePinEps);
+        *velPtr = (raw < 0.0) ? -target : target;
     }
 
 %end
