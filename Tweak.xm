@@ -66,6 +66,7 @@ static const void *kEdgeWaitKey         = &kEdgeWaitKey;
 static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 // ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
 static const void *kAutoActiveKey       = &kAutoActiveKey;
+static const void *kCornerGestureKey    = &kCornerGestureKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
 static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
 static const void *kAutoLastYKey        = &kAutoLastYKey;
@@ -359,7 +360,14 @@ void openSimpleMenu() {
         BOOL cornerDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()];
         UIAlertAction *cornerToggle = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@角落手势", cornerDisabled ? @"启用" : @"禁用"] style:UIAlertActionStyleDefault
                                 handler:^(UIAlertAction *action) {
-                                    [[NSUserDefaults standardUserDefaults] setBool:(!cornerDisabled) forKey:cornerDisabledKey()];
+                                    BOOL newDisabled = !cornerDisabled;
+                                    [[NSUserDefaults standardUserDefaults] setBool:newDisabled forKey:cornerDisabledKey()];
+                                    // 关键：同步翻转已挂窗口上的识别器 enabled。只靠 handler 里 early-return
+                                    // 不够 —— 识别器照样识别并把触摸 cancel 掉，App 自己的底部长按就被摸死了。
+                                    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                                        UILongPressGestureRecognizer *g = objc_getAssociatedObject(w, kCornerGestureKey);
+                                        if (g) g.enabled = !newDisabled;
+                                    }
                                 }];
         UIAlertAction *dismiss = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
         [alert addAction:speed];
@@ -387,11 +395,15 @@ void openSimpleMenu() {
         UILongPressGestureRecognizer *menuGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
         menuGestureRecognizer.numberOfTouchesRequired = 3;
         [self addGestureRecognizer:menuGestureRecognizer];
-        // 左下角长按：单指按住 0.6s，比三指长按好按且几乎不会误触（见 handleCornerLongPress 内守卫）
+        // 左下角长按：单指按住 0.6s，比三指长按好按且几乎不会误触（见 handleCornerLongPress 内守卫）。
+        // enabled 必须跟 per-app 开关同步：识别器只要 enabled 且识别成功就会 cancel 触摸，
+        // 仅在 handler 里 early-return 挡不住"App 底部长按被摸死"的问题。
         UILongPressGestureRecognizer *cornerGesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleCornerLongPress:)];
         cornerGesture.numberOfTouchesRequired = 1;
         cornerGesture.minimumPressDuration = kMenuCornerHold;
+        cornerGesture.enabled = ![[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()];
         [self addGestureRecognizer:cornerGesture];
+        objc_setAssociatedObject(self, kCornerGestureKey, cornerGesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kMenuAddedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
