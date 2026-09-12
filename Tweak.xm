@@ -18,6 +18,8 @@
 - (void)attachStopTouchGesture;
 - (void)detachStopTouchGesture;
 - (void)forceLayoutVisibleCells;
+- (void)scheduleEdgeResume;
+- (void)cancelEdgeResume;
 @end
 
 @interface UIWindow (UIScroller)
@@ -67,6 +69,7 @@ static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 // ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
 static const void *kAutoActiveKey       = &kAutoActiveKey;
 static const void *kCornerGestureKey    = &kCornerGestureKey;
+static const void *kEdgeResumeTimerKey  = &kEdgeResumeTimerKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
 static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
 static const void *kAutoLastYKey        = &kAutoLastYKey;
@@ -619,6 +622,8 @@ void openSimpleMenu() {
     // Telegram 的位置补偿等全部照常工作（对 App 来说就是"一次很长的减速"），兼容性最好。
     %new
     - (void)startAutoNative {
+        // 新一轮接管：取消上一轮挂着的"贴边等新内容"watcher，避免两套驱动互相踩
+        [self cancelEdgeResume];
         // 记录续滚起点：贴边检测基准（offset + 时刻）配合 kAutoV0Key（松手实测速度）恒速续滚
         objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -642,6 +647,40 @@ void openSimpleMenu() {
         }
         [self detachStopTouchGesture];
         [self stopAutoDisableTimer];
+    }
+
+    %new
+    - (void)cancelEdgeResume {
+        NSTimer *t = objc_getAssociatedObject(self, kEdgeResumeTimerKey);
+        if (t) {
+            [t invalidate];
+            objc_setAssociatedObject(self, kEdgeResumeTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+
+    %new
+    - (void)scheduleEdgeResume {
+        [self cancelEdgeResume];
+        // 贴边等满后进入"等新内容"状态：盯住 contentSize，App 一插入新内容
+        // 就用自有驱动（startUIScroller）接着巡航，用户无感知；等到超时/用户
+        // 手指按上（isTracking）就放弃，回归普通滚动。
+        CGFloat baseCs = self.contentSize.height;
+        __weak typeof(self) weakSelf = self;
+        CFTimeInterval deadline = CACurrentMediaTime() + kEdgeWaitTimeout;
+        NSTimer *t = [NSTimer timerWithTimeInterval:0.25 repeats:YES block:^(NSTimer *timer) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (!strongSelf) { [timer invalidate]; return; }
+            if (strongSelf.isTracking || CACurrentMediaTime() > deadline) {
+                [strongSelf cancelEdgeResume];
+                return;
+            }
+            if (fabs(strongSelf.contentSize.height - baseCs) > 0.5) {
+                [strongSelf cancelEdgeResume];
+                [strongSelf startUIScroller];   // 新内容到位，接着按原力道巡航
+            }
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+        objc_setAssociatedObject(self, kEdgeResumeTimerKey, t, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
     %new
@@ -984,7 +1023,13 @@ void openSimpleMenu() {
             objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kAutoLastCsKey, @(csH), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         } else if (lastT > 0.0 && now - lastT > kEdgeWaitTimeout) {
+            // 贴边等满仍无新内容：把速度归零并停掉减速动画 —— 让 App 收到
+            // scrollViewDidEndDecelerating。很多懒加载挂在这个"滑完了"的回调上，
+            // 原生续滚的动画一直不结束，App 就永远不触发加载（手动滑完立即出的原因）。
+            *velPtr = 0.0;
             [self stopAutoNative];
+            [self setContentOffset:self.contentOffset animated:NO];  // 确保减速动画立刻终止
+            [self scheduleEdgeResume];   // 盯住 contentSize，新内容一到自动续上巡航
             return;
         }
         double raw = *velPtr;
