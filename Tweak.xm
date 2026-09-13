@@ -83,6 +83,9 @@ static int uscAwakeTick = 0;
 int scrollSpeedType = 4;    // 0:慢速 1:标准 2:较快 3:快速 4:自动（跟随滑动力道，默认）
 int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable
 BOOL keepScreenAwake = NO;  // 自动滚动期间禁止息屏（默认关，菜单里可开）
+int autoForceMultiplier = 100; // 自动档力道倍率（%）：100=1×，菜单可选 0.5/1/1.5/2
+int cornerGestureSide = 0;  // 角落手势位置：0=左下 1=右下（可按 App 禁用，见 cornerDisabledKey）
+int gearSpeedAdjust = 0;    // 固定挡速度微调（pt/s）：菜单 ±100 细调基准档位
 
 // 速度档位名（菜单显示用）
 static NSString *speedName(int type) {
@@ -394,10 +397,51 @@ void openSimpleMenu() {
                                         if (g) g.enabled = !newDisabled;
                                     }
                                 }];
+        UIAlertAction *gearAdjust = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"速度微调：%+d pt/s", gearSpeedAdjust] style:UIAlertActionStyleDefault
+                                handler:^(UIAlertAction *action) {
+                                    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"固定挡速度微调"
+                                                                                                   message:nil
+                                                                                            preferredStyle:UIAlertControllerStyleAlert];
+                                    int options[] = {-100, -50, -20, 0, 20, 50, 100};
+                                    for (int i = 0; i < 7; i++) {
+                                        int sel = options[i];
+                                        NSString *title = (sel == gearSpeedAdjust) ?
+                                            [NSString stringWithFormat:@"✓ %+d pt/s", sel] :
+                                            [NSString stringWithFormat:@"%+d pt/s", sel];
+                                        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+                                                                                 handler:^(UIAlertAction *a) { gearSpeedAdjust = sel; }]];
+                                    }
+                                    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+                                    [topViewController() presentViewController:sheet animated:YES completion:nil];
+                                }];
+        UIAlertAction *forceMult = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"力道倍率：%.1f×", autoForceMultiplier / 100.0] style:UIAlertActionStyleDefault
+                                handler:^(UIAlertAction *action) {
+                                    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"选择力道倍率（自动档）"
+                                                                                                   message:nil
+                                                                                            preferredStyle:UIAlertControllerStyleAlert];
+                                    int options[] = {50, 100, 150, 200};
+                                    for (int i = 0; i < 4; i++) {
+                                        int sel = options[i];
+                                        NSString *title = (sel == autoForceMultiplier) ?
+                                            [NSString stringWithFormat:@"✓ %.1f×", sel / 100.0] :
+                                            [NSString stringWithFormat:@"%.1f×", sel / 100.0];
+                                        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+                                                                                 handler:^(UIAlertAction *a) { autoForceMultiplier = sel; }]];
+                                    }
+                                    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+                                    [topViewController() presentViewController:sheet animated:YES completion:nil];
+                                }];
+        UIAlertAction *cornerSide = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"角落位置：%@", cornerGestureSide == 0 ? @"左下" : @"右下"] style:UIAlertActionStyleDefault
+                                handler:^(UIAlertAction *action) {
+                                    cornerGestureSide = !cornerGestureSide;
+                                }];
         UIAlertAction *dismiss = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
         [alert addAction:speed];
+        [alert addAction:gearAdjust];
+        [alert addAction:forceMult];
         [alert addAction:autoDisable];
         [alert addAction:awake];
+        [alert addAction:cornerSide];
         [alert addAction:toggle];
         [alert addAction:cornerToggle];
         [alert addAction:dismiss];
@@ -446,9 +490,10 @@ void openSimpleMenu() {
         // per-app 禁用：部分 App 底部角落有自己的长按功能（拖拽排序/清除角标等），
         // 在菜单里关掉角落手势即可 —— 触发频率低，每次读一次 NSUserDefaults 开销可忽略。
         if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) return;
-        // 1) 落点必须在左下角扇形内（圆心 = 屏幕左下角点，半径 kMenuCornerRadius）
+        // 1) 落点必须在角落扇形内（圆心 = 屏幕下角点，半径 kMenuCornerRadius；左右可切）
         CGPoint p = [gesture locationInView:self];
-        CGFloat dx = p.x, dy = p.y - CGRectGetHeight(self.bounds);
+        CGFloat dx = (cornerGestureSide == 1) ? (CGRectGetWidth(self.bounds) - p.x) : p.x;
+        CGFloat dy = p.y - CGRectGetHeight(self.bounds);
         if (sqrt(dx * dx + dy * dy) > (CGFloat)kMenuCornerRadius) return;
         // 2) 震动反馈（长按没反馈容易不知道有没有用上劲）+ 弹菜单（内部有 menuBusy 防重入）
         UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
@@ -858,6 +903,11 @@ void openSimpleMenu() {
         } else {
             // 固定挡：稳态速度（pt/s）
             float steady = (scrollSpeedType >= 0 && scrollSpeedType <= 3) ? kGearSpeed[scrollSpeedType] : 160.0f;
+            // 固定挡速度微调（菜单 ±100pt/s）：在基准档位上细调
+            if (gearSpeedAdjust != 0) {
+                steady += gearSpeedAdjust;
+                if (steady < 10.0f) steady = 10.0f;
+            }
             // 自定义惯性：起步速度 = 交接实测速度 v0（= 手上力道），之后按 e^(-t/1.2s)
             // 平滑收到档位速度。不夹到 steady：轻扫时（v0 < steady）需要让它平滑"升"上去，
             // 强行取 steady 反而会突跳。
@@ -943,8 +993,13 @@ void openSimpleMenu() {
                 objc_setAssociatedObject(self, kExpectedSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 return;
             }
-            // 等太久还是没新内容 -> 认为真的到底/到顶了
-            if (nowE - [waitStart doubleValue] > kEdgeWaitTimeout) { [self stopUIScroller]; return; }
+            // 等太久还是没新内容 -> 认为真的到底/到顶了（轻震提示）
+            if (nowE - [waitStart doubleValue] > kEdgeWaitTimeout) {
+                [self stopUIScroller];
+                UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+                [h impactOccurred];
+                return;
+            }
             // 保持贴在边界上（持续触发 App 的加载更多），本帧不再推进
             CGPoint edge = self.contentOffset;
             edge.y = (targetY >= maxOffset) ? maxOffset : minOffset;
@@ -1028,11 +1083,14 @@ void openSimpleMenu() {
         } else if (lastT > 0.0 && now - lastT > kEdgeStallTime) {
             *velPtr = 0.0;
             [self stopAutoNative];
+            // 到头提示：轻震一下，不用盯着看才知道自动滚动停了
+            UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+            [h impactOccurred];
             return;
         }
         // 恒速目标：松手瞬间 pan 手势的实测速度（pt/s，接管入口存好），换算 pt/ms 并封顶
         double v0ptps = [objc_getAssociatedObject(self, kAutoV0Key) doubleValue];
-        double target = MIN(v0ptps / 1000.0, kAutoNativeCruiseMaxV);
+        double target = MIN((v0ptps / 1000.0) * (autoForceMultiplier / 100.0), kAutoNativeCruiseMaxV);
         if (target < kAutoNativeStopV) {
             // 力道异常地小（<100pt/s）：交还系统自然滑停（stopAutoNative 会恢复系数）
             [self stopAutoNative];
