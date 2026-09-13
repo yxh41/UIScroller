@@ -636,22 +636,31 @@ void openSimpleMenu() {
     [cpDisableAppBtn.heightAnchor constraintEqualToConstant:34].active = YES;
     [stack addArrangedSubview:cpDisableAppBtn];
 
-    // 布局：stack 填满 blur，面板贴底
+    // 布局：先离屏量内容高度，再定面板 frame。
+    // 注意顺序：stack 一旦被钉到 contentView 上再调 systemLayoutSizeFittingSize，
+    // 钉死的 4 条外部约束会参与求解，0 尺寸下解不出 -> 引擎 break 约束返回垃圾值
+    // （真机表现：面板撑满整屏且内容超宽）。必须先量、后挂约束。
+    CGFloat winW = CGRectGetWidth(host.bounds);
+    CGFloat winH = CGRectGetHeight(host.bounds);
+    NSLayoutConstraint *measureW = [stack.widthAnchor constraintEqualToConstant:winW];
+    measureW.active = YES;
+    CGSize fit = [stack systemLayoutSizeFittingSize:CGSizeMake(winW, 0)];
+    measureW.active = NO;
+    CGFloat panelH = fit.height + host.safeAreaInsets.bottom;
+
+    blur.frame = CGRectMake(0, 0, winW, panelH);
+    controlPanel.frame = CGRectMake(0, winH, winW, panelH);
+
+    // stack 填满 blur：底部钉 safeArea 而不是 contentView，
+    // 否则 panelH 比 fit.height 多出的安全区高度会把行强行拉伸
     [blur.contentView addSubview:stack];
     [NSLayoutConstraint activateConstraints:@[
         [stack.topAnchor constraintEqualToAnchor:blur.contentView.topAnchor],
         [stack.leadingAnchor constraintEqualToAnchor:blur.contentView.leadingAnchor],
         [stack.trailingAnchor constraintEqualToAnchor:blur.contentView.trailingAnchor],
-        [stack.bottomAnchor constraintEqualToAnchor:blur.contentView.bottomAnchor],
+        [stack.bottomAnchor constraintEqualToAnchor:blur.contentView.safeAreaLayoutGuide.bottomAnchor],
     ]];
 
-    CGFloat winW = CGRectGetWidth(host.bounds);
-    CGFloat winH = CGRectGetHeight(host.bounds);
-    CGSize fit = [stack systemLayoutSizeFittingSize:CGSizeMake(winW, UILayoutFittingCompressedSize.height)];
-    CGFloat panelH = fit.height + host.safeAreaInsets.bottom;
-
-    blur.frame = CGRectMake(0, 0, winW, panelH);
-    controlPanel.frame = CGRectMake(0, winH, winW, panelH);
     [host addSubview:controlBackdrop];
     [host addSubview:controlPanel];
     [stack layoutIfNeeded];
