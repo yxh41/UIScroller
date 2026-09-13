@@ -269,12 +269,16 @@ static UILabel *hudTimeLabel = nil;
 static UIView  *hudDot      = nil;
 
 static UIView *hudEnsureCapsule(void) {
-    if (hudCapsule && hudCapsule.superview) return hudCapsule;
+    // 必须挂到当前 keyWindow（normal level），否则可能挂到后台的 normal-level 窗口上被盖住
     UIWindow *host = nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.windowLevel == UIWindowLevelNormal && !w.hidden) { host = w; break; }
+        if (w.isKeyWindow && w.windowLevel == UIWindowLevelNormal && !w.hidden) { host = w; break; }
     }
     if (!host) return nil;
+    // 如果胶囊挂在了别的（非 key/隐藏）窗口上，移除重挂，防止切换 App 后回到旧窗口
+    if (hudCapsule && hudCapsule.superview && hudCapsule.superview != host) {
+        [hudCapsule removeFromSuperview];
+    }
     if (!hudCapsule) {
         hudCapsule = [[UIView alloc] initWithFrame:CGRectZero];
         UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
@@ -297,7 +301,7 @@ static UIView *hudEnsureCapsule(void) {
         hudCapsule.layer.masksToBounds = YES;
         hudCapsule.userInteractionEnabled = NO; // 不挡触摸
     }
-    [host addSubview:hudCapsule];
+    if (hudCapsule.superview != host) [host addSubview:hudCapsule];
     return hudCapsule;
 }
 
@@ -528,7 +532,7 @@ void openSimpleMenu() {
     UIStackView *headRow = [[UIStackView alloc] init];
     headRow.axis = UILayoutConstraintAxisHorizontal;
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"UIScroller v3"; // 临时版本标记，确认真机装上了新 deb 再恢复
+    title.text = @"UIScroller";
     title.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
     title.textColor = [UIColor labelColor];
     cpSummaryLabel = [[UILabel alloc] init];
@@ -992,6 +996,7 @@ void openSimpleMenu() {
         [self stopAutoDisableTimer];
         __weak typeof(self) weakSelf = self;
         __block int remain = autoDisableMinutes * 60;
+        updateCountdownHUD(remain); // 启动瞬间就显示，不用等 1 秒后才出现
         NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
             __strong typeof(weakSelf) strongSelf = weakSelf;
             remain--;
@@ -1044,6 +1049,7 @@ void openSimpleMenu() {
         if (autoDisableMinutes > 0) {
             [self stopAutoDisableTimer];
             __block int remain = autoDisableMinutes * 60;
+            updateCountdownHUD(remain); // 启动瞬间立即显示
             // 1 秒一次（不是逐帧）刷新顶部倒计时胶囊
             NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
                 __strong typeof(weakSelf) strongSelf = weakSelf;
