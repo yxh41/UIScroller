@@ -747,10 +747,14 @@ void openSimpleMenu() {
     [editStop addTarget:proxy action:@selector(cp_editStop) forControlEvents:UIControlEventTouchUpInside];
     [doneBtn addTarget:proxy action:@selector(cp_close) forControlEvents:UIControlEventTouchUpInside];
     [cpDisableAppBtn addTarget:proxy action:@selector(cp_toggleDisableApp) forControlEvents:UIControlEventTouchUpInside];
-    // 标题栏区域下拉关闭（带阻尼；上拉不跟手，避免误触）
+    // 标题栏区域 + 顶部抓手(拉手) 都可下拉关闭（带阻尼；上拉不跟手，避免误触）。
+    // 之前手势只挂在 headRow，用户拉"拉手"（grabberWrap）时根本没手势接住 -> 没反应。
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:proxy action:@selector(cp_pan:)];
     pan.cancelsTouchesInView = NO;
     [headRow addGestureRecognizer:pan];
+    UIPanGestureRecognizer *panGrab = [[UIPanGestureRecognizer alloc] initWithTarget:proxy action:@selector(cp_pan:)];
+    panGrab.cancelsTouchesInView = NO;
+    [grabberWrap addGestureRecognizer:panGrab];
 
     // 背景点击关闭（用手势代理挂 selector 到 proxy）
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:cpTargetProxy() action:@selector(cp_close)];
@@ -1054,7 +1058,7 @@ void openSimpleMenu() {
         __weak typeof(self) weakSelf = self;
         __block int remain = autoDisableMinutes * 60;
         updateCountdownHUD(remain); // 启动瞬间就显示，不用等 1 秒后才出现
-        NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
+        NSTimer *ad = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
             __strong typeof(weakSelf) strongSelf = weakSelf;
             remain--;
             if (remain > 0) updateCountdownHUD(remain); // 胶囊全程可见，≤10s 变琥珀、≤5s 变红
@@ -1064,6 +1068,10 @@ void openSimpleMenu() {
                 if (strongSelf) [strongSelf autoDisableScrolling];
             }
         }];
+        // 关键修复：自动滚动由系统 _smoothScrollWithUpdateTime: 每帧驱动，主 runloop 长期停在
+        // 滚动动画 mode；默认 mode 的 timer 在此期间完全不 fire，倒计时就卡在初始值不动。
+        // 挂到 NSRunLoopCommonModes，让它在任意 mode（含滚动）下都能按时触发。
+        [[NSRunLoop mainRunLoop] addTimer:ad forMode:NSRunLoopCommonModes];
         objc_setAssociatedObject(self, kAutoDisableTimerKey, ad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
@@ -1087,7 +1095,6 @@ void openSimpleMenu() {
         objc_setAssociatedObject(self, kExpectedSetKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC); // 新会话：还没写过值，不做比对
         objc_setAssociatedObject(self, kEdgeWaitKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);    // 新会话：清空贴边等待状态
 
-        __weak typeof(self) weakSelf = self;
         // 用 CADisplayLink 代替 0.01s NSTimer：跟随屏幕刷新率（60/120Hz），滚动更顺滑、更省电。
         // link 强引用 proxy，proxy 只弱引用 self -> 无 retain cycle。
         UIScrollerTickProxy *proxy = [[UIScrollerTickProxy alloc] init];
@@ -1103,23 +1110,9 @@ void openSimpleMenu() {
         // 开着它才能在长时间自动滚动时保持亮屏。
         [self applyKeepAwakeIfEnabled];
 
-        if (autoDisableMinutes > 0) {
-            [self stopAutoDisableTimer];
-            __block int remain = autoDisableMinutes * 60;
-            updateCountdownHUD(remain); // 启动瞬间立即显示
-            // 1 秒一次（不是逐帧）刷新顶部倒计时胶囊
-            NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
-                __strong typeof(weakSelf) strongSelf = weakSelf;
-                remain--;
-                if (remain > 0) updateCountdownHUD(remain); // 胶囊全程可见，≤10s 变琥珀、≤5s 变红
-                if (remain <= 0) {
-                    hideCountdownHUD();
-                    [timer invalidate];
-                    if (strongSelf) [strongSelf autoDisableScrolling];
-                }
-            }];
-            objc_setAssociatedObject(self, kAutoDisableTimerKey, ad, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
+        // 自动停止计时器：两条驱动路径（原生续滚 / 自有驱动）共用 setupAutoDisableTimer 一套，
+        // 避免重复实现互相覆盖 kAutoDisableTimerKey，也保证计时器都挂在 NSRunLoopCommonModes。
+        [self setupAutoDisableTimer];
     }
 
     %new
