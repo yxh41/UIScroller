@@ -316,10 +316,10 @@ static void updateCountdownHUD(int seconds) {
     UIView *host = cap.superview;
     CGFloat top = 6.0;
     if (@available(iOS 11.0, *)) {
-        // 「贴到刘海位置」：让胶囊底边落在 safeArea 顶边（状态栏/刘海正下方），整块上移到刘海处。
-        // 居中放在刘海正下方时正好处于状态栏中央空白区（时间/电量在两侧），不会被系统文字盖住；
+        // 「贴到刘海位置、略下移一点」：胶囊底边落在 safeArea 顶边下方约 12pt，
+        // 整块仍上贴刘海、居中在状态栏中央空白区（时间/电量在两侧），不会盖系统文字；
         // 同时整块位于 App 大标题之上，彻底不压标题。下限保护防止非刘海设备跑飞。
-        top = MAX(6.0, host.safeAreaInsets.top - h + 4.0);
+        top = MAX(6.0, host.safeAreaInsets.top - h + 12.0);
     }
     // 刘海正下方居中（水平居中 + 上贴刘海）
     CGFloat cx = CGRectGetWidth(host.bounds) / 2.0;
