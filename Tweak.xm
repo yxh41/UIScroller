@@ -376,9 +376,7 @@ static void closeControlPanel(void) {
     controlBackdrop = nil; controlPanel = nil;
     [UIView animateWithDuration:0.22 animations:^{
         backdrop.alpha = 0;
-        CGRect f = panel.frame;
-        f.origin.y = CGRectGetHeight(backdrop.bounds);
-        panel.frame = f;
+        panel.transform = CGAffineTransformMakeTranslation(0, CGRectGetHeight(panel.bounds));
     } completion:^(BOOL finished) {
         [backdrop removeFromSuperview];
         [panel removeFromSuperview];
@@ -530,7 +528,7 @@ void openSimpleMenu() {
     UIStackView *headRow = [[UIStackView alloc] init];
     headRow.axis = UILayoutConstraintAxisHorizontal;
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"UIScroller";
+    title.text = @"UIScroller v3"; // 临时版本标记，确认真机装上了新 deb 再恢复
     title.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
     title.textColor = [UIColor labelColor];
     cpSummaryLabel = [[UILabel alloc] init];
@@ -636,31 +634,27 @@ void openSimpleMenu() {
     [cpDisableAppBtn.heightAnchor constraintEqualToConstant:34].active = YES;
     [stack addArrangedSubview:cpDisableAppBtn];
 
-    // 布局：确定性离屏测量 stack 真实高度（不靠 systemLayoutSizeFittingSize，
-    // 它在真机上对裸 stack 经常拿不到正确高度，导致面板跑飞）。做法是把 stack 真放
-    // 进一个给定宽度的临时容器里实际 layout 一遍，直接读 bounds 高度。
-    CGFloat winW = CGRectGetWidth(host.bounds);
-    CGFloat winH = CGRectGetHeight(host.bounds);
-    UIView *measureBox = [[UIView alloc] initWithFrame:CGRectMake(0, 0, winW, 10)];
-    measureBox.translatesAutoresizingMaskIntoConstraints = NO;
-    [measureBox addSubview:stack];
+    // 布局：彻底放弃手动测量，改用 Auto Layout 内容驱动高度。
+    // 之前两版手动测量在真机上总翻车，导致面板整屏炸裂；这次让 stack 的 intrinsic
+    // content 高度通过约束链自己决定 panel 高度，并用 transform 动画上滑/下滑。
+    [stack setContentHuggingPriority:999 forAxis:UILayoutConstraintAxisVertical]; // 让内容决定高度，但允许 90% 上限覆盖
+
+    controlPanel.translatesAutoresizingMaskIntoConstraints = NO;
+    blur.translatesAutoresizingMaskIntoConstraints = NO;
+
+    [host addSubview:controlBackdrop];
+    [host addSubview:controlPanel];
+
+    // blur 铺满 panel
+    [controlPanel addSubview:blur];
     [NSLayoutConstraint activateConstraints:@[
-        [stack.leadingAnchor constraintEqualToAnchor:measureBox.leadingAnchor],
-        [stack.trailingAnchor constraintEqualToAnchor:measureBox.trailingAnchor],
-        [stack.topAnchor constraintEqualToAnchor:measureBox.topAnchor],
+        [blur.topAnchor constraintEqualToAnchor:controlPanel.topAnchor],
+        [blur.bottomAnchor constraintEqualToAnchor:controlPanel.bottomAnchor],
+        [blur.leadingAnchor constraintEqualToAnchor:controlPanel.leadingAnchor],
+        [blur.trailingAnchor constraintEqualToAnchor:controlPanel.trailingAnchor],
     ]];
-    [measureBox layoutIfNeeded];
-    CGFloat contentH = CGRectGetHeight(stack.bounds);
-    [stack removeFromSuperview];
-    // 安全上限：万一样板量错，也不允许超过屏幕 95%，避免再次整屏炸裂
-    CGFloat panelH = contentH + host.safeAreaInsets.bottom;
-    if (panelH > winH * 0.95) panelH = winH * 0.95;
 
-    blur.frame = CGRectMake(0, 0, winW, panelH);
-    controlPanel.frame = CGRectMake(0, winH, winW, panelH);
-
-    // stack 填满 blur：底部钉 safeArea 而不是 contentView，
-    // 否则 panelH 比 contentH 多出的安全区高度会把行强行拉伸
+    // stack 填满 contentView，底部留安全区
     [blur.contentView addSubview:stack];
     [NSLayoutConstraint activateConstraints:@[
         [stack.topAnchor constraintEqualToAnchor:blur.contentView.topAnchor],
@@ -669,10 +663,23 @@ void openSimpleMenu() {
         [stack.bottomAnchor constraintEqualToAnchor:blur.contentView.safeAreaLayoutGuide.bottomAnchor],
     ]];
 
-    [host addSubview:controlBackdrop];
-    [host addSubview:controlPanel];
-    [stack layoutIfNeeded];
-    grab.center = CGPointMake(CGRectGetWidth(grabberWrap.bounds) / 2.0, 7); // 布局后再居中（flexible 双边距保持居中）
+    // 面板宽度铺满 host，底部贴 host 底；高度由内容决定（顶部不钉），加 90% 屏高上限兜底
+    [NSLayoutConstraint activateConstraints:@[
+        [controlPanel.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
+        [controlPanel.trailingAnchor constraintEqualToAnchor:host.trailingAnchor],
+        [controlPanel.bottomAnchor constraintEqualToAnchor:host.bottomAnchor],
+        [controlPanel.heightAnchor constraintLessThanOrEqualToAnchor:host.heightAnchor multiplier:0.9],
+    ]];
+
+    // 立即 layout，让 Auto Layout 算出内容真实高度
+    [controlPanel setNeedsLayout];
+    [controlPanel layoutIfNeeded];
+
+    // 抓手居中（此时 grabberWrap 已铺到 stack 实际宽度）
+    grab.center = CGPointMake(CGRectGetWidth(grabberWrap.bounds) / 2.0, 7);
+
+    // 初始位置：面板整体下移到刚好藏到屏幕下方，然后动画上滑
+    controlPanel.transform = CGAffineTransformMakeTranslation(0, CGRectGetHeight(controlPanel.bounds));
 
     // 事件绑定：全部走单例 proxy 分发（见 USControlPanelProxy）
     USControlPanelProxy *proxy = cpTargetProxy();
@@ -690,7 +697,7 @@ void openSimpleMenu() {
 
     [UIView animateWithDuration:0.28 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
         controlBackdrop.alpha = 1;
-        controlPanel.frame = CGRectMake(0, winH - panelH, winW, panelH);
+        controlPanel.transform = CGAffineTransformIdentity;
     } completion:nil];
 }
 
