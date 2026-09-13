@@ -293,7 +293,7 @@ static UIView *hudEnsureCapsule(void) {
         [hudCapsule addSubview:hudDot];
 
         hudTimeLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        hudTimeLabel.font = [UIFont monospacedDigitSystemFontOfSize:13.0 weight:UIFontWeightMedium];
+        hudTimeLabel.font = [UIFont monospacedDigitSystemFontOfSize:12.0 weight:UIFontWeightMedium];
         hudTimeLabel.textColor = [UIColor labelColor];
         [hudCapsule addSubview:hudTimeLabel];
 
@@ -316,8 +316,10 @@ static void updateCountdownHUD(int seconds) {
     UIView *host = cap.superview;
     CGFloat top = 26.0;
     if (@available(iOS 11.0, *)) top = host.safeAreaInsets.top + 6.0;
-    cap.frame = CGRectMake((CGRectGetWidth(host.bounds) - w) / 2.0, top, w, h);
-    cap.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    // 居中会被 App 大标题盖住，改放到右上角，只可能 overlap 右侧导航按钮
+    CGFloat rightMargin = 16.0;
+    cap.frame = CGRectMake(CGRectGetWidth(host.bounds) - w - rightMargin, top, w, h);
+    cap.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
     hudDot.frame = CGRectMake(12.0, (h - 8.0) / 2.0, 8.0, 8.0);
     hudTimeLabel.frame = CGRectMake(26.0, (h - CGRectGetHeight(hudTimeLabel.bounds)) / 2.0,
                                     CGRectGetWidth(hudTimeLabel.bounds), CGRectGetHeight(hudTimeLabel.bounds));
