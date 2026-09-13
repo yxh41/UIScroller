@@ -636,23 +636,31 @@ void openSimpleMenu() {
     [cpDisableAppBtn.heightAnchor constraintEqualToConstant:34].active = YES;
     [stack addArrangedSubview:cpDisableAppBtn];
 
-    // 布局：先离屏量内容高度，再定面板 frame。
-    // 注意顺序：stack 一旦被钉到 contentView 上再调 systemLayoutSizeFittingSize，
-    // 钉死的 4 条外部约束会参与求解，0 尺寸下解不出 -> 引擎 break 约束返回垃圾值
-    // （真机表现：面板撑满整屏且内容超宽）。必须先量、后挂约束。
+    // 布局：确定性离屏测量 stack 真实高度（不靠 systemLayoutSizeFittingSize，
+    // 它在真机上对裸 stack 经常拿不到正确高度，导致面板跑飞）。做法是把 stack 真放
+    // 进一个给定宽度的临时容器里实际 layout 一遍，直接读 bounds 高度。
     CGFloat winW = CGRectGetWidth(host.bounds);
     CGFloat winH = CGRectGetHeight(host.bounds);
-    NSLayoutConstraint *measureW = [stack.widthAnchor constraintEqualToConstant:winW];
-    measureW.active = YES;
-    CGSize fit = [stack systemLayoutSizeFittingSize:CGSizeMake(winW, 0)];
-    measureW.active = NO;
-    CGFloat panelH = fit.height + host.safeAreaInsets.bottom;
+    UIView *measureBox = [[UIView alloc] initWithFrame:CGRectMake(0, 0, winW, 10)];
+    measureBox.translatesAutoresizingMaskIntoConstraints = NO;
+    [measureBox addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.leadingAnchor constraintEqualToAnchor:measureBox.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:measureBox.trailingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:measureBox.topAnchor],
+    ]];
+    [measureBox layoutIfNeeded];
+    CGFloat contentH = CGRectGetHeight(stack.bounds);
+    [stack removeFromSuperview];
+    // 安全上限：万一样板量错，也不允许超过屏幕 95%，避免再次整屏炸裂
+    CGFloat panelH = contentH + host.safeAreaInsets.bottom;
+    if (panelH > winH * 0.95) panelH = winH * 0.95;
 
     blur.frame = CGRectMake(0, 0, winW, panelH);
     controlPanel.frame = CGRectMake(0, winH, winW, panelH);
 
     // stack 填满 blur：底部钉 safeArea 而不是 contentView，
-    // 否则 panelH 比 fit.height 多出的安全区高度会把行强行拉伸
+    // 否则 panelH 比 contentH 多出的安全区高度会把行强行拉伸
     [blur.contentView addSubview:stack];
     [NSLayoutConstraint activateConstraints:@[
         [stack.topAnchor constraintEqualToAnchor:blur.contentView.topAnchor],
