@@ -314,11 +314,14 @@ static void updateCountdownHUD(int seconds) {
     CGFloat w = CGRectGetWidth(hudTimeLabel.bounds) + 38.0; // dot 8 + 间距 + 左右 padding
     CGFloat h = 32.0;
     UIView *host = cap.superview;
-    CGFloat top = 26.0;
-    if (@available(iOS 11.0, *)) top = host.safeAreaInsets.top + 6.0;
-    // 刘海正下方居中：上面留 safeAreaInsets.top 余量，避免压在状态栏/刘海上；
-    // 居中可能与部分 App 的大标题重叠，但胶囊 userInteractionEnabled=NO 不挡触摸，
-    // 且只在自动滚动期间显示，可接受。
+    CGFloat top = 6.0;
+    if (@available(iOS 11.0, *)) {
+        // 「贴到刘海位置」：让胶囊底边落在 safeArea 顶边（状态栏/刘海正下方），整块上移到刘海处。
+        // 居中放在刘海正下方时正好处于状态栏中央空白区（时间/电量在两侧），不会被系统文字盖住；
+        // 同时整块位于 App 大标题之上，彻底不压标题。下限保护防止非刘海设备跑飞。
+        top = MAX(6.0, host.safeAreaInsets.top - h + 4.0);
+    }
+    // 刘海正下方居中（水平居中 + 上贴刘海）
     CGFloat cx = CGRectGetWidth(host.bounds) / 2.0;
     cap.frame = CGRectMake(cx - w / 2.0, top, w, h);
     cap.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
