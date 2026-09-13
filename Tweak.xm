@@ -316,10 +316,12 @@ static void updateCountdownHUD(int seconds) {
     UIView *host = cap.superview;
     CGFloat top = 26.0;
     if (@available(iOS 11.0, *)) top = host.safeAreaInsets.top + 6.0;
-    // 居中会被 App 大标题盖住，改放到右上角，只可能 overlap 右侧导航按钮
-    CGFloat rightMargin = 16.0;
-    cap.frame = CGRectMake(CGRectGetWidth(host.bounds) - w - rightMargin, top, w, h);
-    cap.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
+    // 刘海正下方居中：上面留 safeAreaInsets.top 余量，避免压在状态栏/刘海上；
+    // 居中可能与部分 App 的大标题重叠，但胶囊 userInteractionEnabled=NO 不挡触摸，
+    // 且只在自动滚动期间显示，可接受。
+    CGFloat cx = CGRectGetWidth(host.bounds) / 2.0;
+    cap.frame = CGRectMake(cx - w / 2.0, top, w, h);
+    cap.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
     hudDot.frame = CGRectMake(12.0, (h - 8.0) / 2.0, 8.0, 8.0);
     hudTimeLabel.frame = CGRectMake(26.0, (h - CGRectGetHeight(hudTimeLabel.bounds)) / 2.0,
                                     CGRectGetWidth(hudTimeLabel.bounds), CGRectGetHeight(hudTimeLabel.bounds));
