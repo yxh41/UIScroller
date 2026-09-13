@@ -260,198 +260,421 @@ id topViewController() {
     else return rootController;
 }
 
-// ── 自动停止倒计时悬浮窗 ──
-// 只在最后 10 秒出现，1 秒更新一次（不跟屏幕刷新率，功耗可忽略）；
-// 关键：userInteractionEnabled = NO，绝不能挡住 App 自己的触摸。
-static UILabel *hudLabel = nil;
+// ── 自动停止倒计时胶囊 ──
+// 顶部居中毛玻璃胶囊：滚动期间全程半透明显示 mm:ss（不打扰阅读），
+// 最后 10 秒变实 + 变色（≤10 琥珀、≤5 红）+ 每秒轻微脉冲。
+// 关键：userInteractionEnabled = NO，绝不挡 App 自己的触摸。
+static UIView  *hudCapsule  = nil;
+static UILabel *hudTimeLabel = nil;
+static UIView  *hudDot      = nil;
 
-static UILabel *hudEnsureLabel(void) {
-    if (hudLabel && hudLabel.superview) return hudLabel;
+static UIView *hudEnsureCapsule(void) {
+    if (hudCapsule && hudCapsule.superview) return hudCapsule;
     UIWindow *host = nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
         if (w.windowLevel == UIWindowLevelNormal && !w.hidden) { host = w; break; }
     }
     if (!host) return nil;
-    if (!hudLabel) {
-        hudLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-        hudLabel.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.65];
-        hudLabel.textColor = [UIColor whiteColor];
-        hudLabel.font = [UIFont monospacedDigitSystemFontOfSize:13.0 weight:UIFontWeightMedium];
-        hudLabel.textAlignment = NSTextAlignmentCenter;
-        hudLabel.layer.cornerRadius = 6.0;
-        hudLabel.layer.masksToBounds = YES;
-        hudLabel.userInteractionEnabled = NO; // 不挡触摸
+    if (!hudCapsule) {
+        hudCapsule = [[UIView alloc] initWithFrame:CGRectZero];
+        UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
+        blur.frame = hudCapsule.bounds;
+        blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        blur.userInteractionEnabled = NO;
+        [hudCapsule addSubview:blur];
+
+        hudDot = [[UIView alloc] initWithFrame:CGRectZero];
+        hudDot.backgroundColor = [UIColor systemGreenColor];
+        hudDot.layer.cornerRadius = 4.0;
+        [hudCapsule addSubview:hudDot];
+
+        hudTimeLabel = [[UILabel alloc] initWithFrame:CGRectZero];
+        hudTimeLabel.font = [UIFont monospacedDigitSystemFontOfSize:13.0 weight:UIFontWeightMedium];
+        hudTimeLabel.textColor = [UIColor labelColor];
+        [hudCapsule addSubview:hudTimeLabel];
+
+        hudCapsule.layer.cornerRadius = 16.0;
+        hudCapsule.layer.masksToBounds = YES;
+        hudCapsule.userInteractionEnabled = NO; // 不挡触摸
     }
-    [host addSubview:hudLabel];
-    return hudLabel;
+    [host addSubview:hudCapsule];
+    return hudCapsule;
 }
 
 static void updateCountdownHUD(int seconds) {
-    if (seconds <= 0) { hudLabel.hidden = YES; return; }
-    UILabel *lab = hudEnsureLabel();
-    if (!lab) return;
-    lab.text = [NSString stringWithFormat:@"自动停止 %d", seconds];
-    [lab sizeToFit];
-    CGFloat w = CGRectGetWidth(lab.bounds) + 16.0;
-    CGFloat h = CGRectGetHeight(lab.bounds) + 8.0;
-    UIView *host = lab.superview;
+    if (seconds <= 0) { hudCapsule.hidden = YES; return; }
+    UIView *cap = hudEnsureCapsule();
+    if (!cap) return;
+    hudTimeLabel.text = [NSString stringWithFormat:@"自动停止 %02d:%02d", seconds / 60, seconds % 60];
+    [hudTimeLabel sizeToFit];
+    CGFloat w = CGRectGetWidth(hudTimeLabel.bounds) + 38.0; // dot 8 + 间距 + 左右 padding
+    CGFloat h = 32.0;
+    UIView *host = cap.superview;
     CGFloat top = 26.0;
     if (@available(iOS 11.0, *)) top = host.safeAreaInsets.top + 6.0;
-    lab.frame = CGRectMake(CGRectGetWidth(host.bounds) - w - 10.0, top, w, h);
-    lab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleBottomMargin;
-    lab.hidden = NO;
+    cap.frame = CGRectMake((CGRectGetWidth(host.bounds) - w) / 2.0, top, w, h);
+    cap.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+    hudDot.frame = CGRectMake(12.0, (h - 8.0) / 2.0, 8.0, 8.0);
+    hudTimeLabel.frame = CGRectMake(26.0, (h - CGRectGetHeight(hudTimeLabel.bounds)) / 2.0,
+                                    CGRectGetWidth(hudTimeLabel.bounds), CGRectGetHeight(hudTimeLabel.bounds));
+
+    // 状态：≤10 秒变实+琥珀，≤5 秒变红，其余半透明绿点
+    BOOL urgent   = seconds <= 10;
+    BOOL critical = seconds <= 5;
+    cap.alpha = urgent ? 1.0 : 0.55;
+    UIColor *accent = critical ? [UIColor systemRedColor] : (urgent ? [UIColor systemOrangeColor] : [UIColor systemGreenColor]);
+    hudDot.backgroundColor = accent;
+    hudTimeLabel.textColor = urgent ? accent : [UIColor labelColor];
+    if (urgent) {
+        // 每秒一次轻微脉冲，余量感知
+        [UIView animateWithDuration:0.14 animations:^{ cap.transform = CGAffineTransformMakeScale(1.06, 1.06); }
+                         completion:^(BOOL f){ [UIView animateWithDuration:0.14 animations:^{ cap.transform = CGAffineTransformIdentity; }]; }];
+    }
+    cap.hidden = NO;
 }
 
 static void hideCountdownHUD(void) {
-    hudLabel.hidden = YES;
+    hudCapsule.hidden = YES;
 }
 
-// 防重入：presentViewController 是异步的，展示动画完成前 topViewController() 还看不到这个 alert。
-// 此时若再次触发就会重复 present —— QQ 等 App 上表现为"点任何按钮菜单都重新弹出并卡住"。
+// 防重入：菜单/面板同时只允许一个实例存在
 static BOOL menuBusy = NO;
 
+// ── 自定义控制面板（替代 UIAlertController 菜单）──
+// 底部半屏卡片：毛玻璃背景 + 顶部圆角 + 分段控件/滑杆/开关，点卡片外即关。
+// 不走 presentViewController —— 顺手绕开了弹窗异步导致的菜单卡死类问题。
+static UIView            *controlBackdrop = nil;
+static UIView            *controlPanel    = nil;
+static UILabel           *cpSummaryLabel  = nil;
+static UILabel           *cpAdjustValue   = nil;
+static UILabel           *cpAutoStopValue = nil;
+static UIButton          *cpDisableAppBtn = nil;
+
+static NSString *cpSummaryText(void) {
+    NSString *corner = [[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()] ? @"角落关"
+                       : (cornerGestureSide == 0 ? @"左下" : @"右下");
+    return [NSString stringWithFormat:@"%@ · %.1f× · %@", speedName(scrollSpeedType), autoForceMultiplier / 100.0, corner];
+}
+
+static void cpRefreshSummary(void) {
+    if (cpSummaryLabel) cpSummaryLabel.text = cpSummaryText();
+}
+
+// 角落手势开关：同步写 per-app 偏好 + 翻转所有已挂窗口识别器的 enabled
+// （enabled=NO 才是真禁用，handler 里 early-return 挡不住触摸被 cancel）
+static void cpSetCornerEnabled(BOOL enabled) {
+    [[NSUserDefaults standardUserDefaults] setBool:(!enabled) forKey:cornerDisabledKey()];
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        UILongPressGestureRecognizer *g = objc_getAssociatedObject(w, kCornerGestureKey);
+        if (g) g.enabled = enabled;
+    }
+}
+
+static void closeControlPanel(void) {
+    if (!controlBackdrop) return;
+    UIView *backdrop = controlBackdrop, *panel = controlPanel;
+    controlBackdrop = nil; controlPanel = nil;
+    [UIView animateWithDuration:0.22 animations:^{
+        backdrop.alpha = 0;
+        CGRect f = panel.frame;
+        f.origin.y = CGRectGetHeight(backdrop.bounds);
+        panel.frame = f;
+    } completion:^(BOOL finished) {
+        [backdrop removeFromSuperview];
+        [panel removeFromSuperview];
+        // 面板已销毁，静态控件引用一并置空，防止悬垂指针
+        cpSummaryLabel = nil; cpAdjustValue = nil; cpAutoStopValue = nil; cpDisableAppBtn = nil;
+        menuBusy = NO;
+    }];
+}
+
+static UILabel *cpSectionLabel(NSString *text) {
+    UILabel *l = [[UILabel alloc] init];
+    l.text = text;
+    l.font = [UIFont systemFontOfSize:11.0];
+    l.textColor = [UIColor secondaryLabelColor];
+    return l;
+}
+
+static void editAutoStopMinutes(void) {
+    UIAlertController *inputAlert = [UIAlertController alertControllerWithTitle:@"设置自动停止时间"
+                                                                        message:@"输入分钟数（0 表示关闭）"
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+    [inputAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.keyboardType = UIKeyboardTypeNumberPad;
+        textField.placeholder = @"分钟";
+        textField.text = [NSString stringWithFormat:@"%d", autoDisableMinutes];
+    }];
+    UIAlertAction *confirm = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        int minutes = [inputAlert.textFields.firstObject.text intValue];
+        if (minutes < 0) minutes = 0;
+        if (minutes > 180) minutes = 180;
+        autoDisableMinutes = minutes;
+        if (cpAutoStopValue) cpAutoStopValue.text = minutes == 0 ? @"关闭" : [NSString stringWithFormat:@"%d 分钟", minutes];
+    }];
+    [inputAlert addAction:confirm];
+    [inputAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    UIViewController *vc = topViewController();
+    if (vc) [vc presentViewController:inputAlert animated:YES completion:nil];
+}
+
+// ── 面板事件分发：UIControl target-action 需要一个常驻对象接住回调，用单例 proxy ──
+@interface USControlPanelProxy : NSObject
+- (void)cp_speedChanged:(UISegmentedControl *)seg;
+- (void)cp_multChanged:(UISegmentedControl *)seg;
+- (void)cp_cornerChanged:(UISegmentedControl *)seg;
+- (void)cp_sliderChanged:(UISlider *)slider;
+- (void)cp_awakeChanged:(UISwitch *)sw;
+- (void)cp_editStop;
+- (void)cp_toggleDisableApp;
+- (void)cp_close;
+@end
+
+@implementation USControlPanelProxy
+- (void)cp_speedChanged:(UISegmentedControl *)seg {
+    scrollSpeedType = (int)seg.selectedSegmentIndex;
+    cpRefreshSummary();
+}
+- (void)cp_multChanged:(UISegmentedControl *)seg {
+    autoForceMultiplier = 50 + (int)seg.selectedSegmentIndex * 50; // 0.5×/1×/1.5×/2×
+    cpRefreshSummary();
+}
+- (void)cp_cornerChanged:(UISegmentedControl *)seg {
+    if (seg.selectedSegmentIndex == 2) {
+        cpSetCornerEnabled(NO);
+    } else {
+        cornerGestureSide = (int)seg.selectedSegmentIndex;
+        cpSetCornerEnabled(YES); // 切位置顺手把"关"状态解开
+    }
+    cpRefreshSummary();
+}
+- (void)cp_sliderChanged:(UISlider *)slider {
+    int snapped = (int)lroundf(slider.value / 20.0f) * 20; // 20 pt/s 步进，避免拖出零碎值
+    if (snapped > 100) snapped = 100;
+    if (snapped < -100) snapped = -100;
+    gearSpeedAdjust = snapped;
+    if (cpAdjustValue) cpAdjustValue.text = [NSString stringWithFormat:@"%+d pt/s", snapped];
+}
+- (void)cp_awakeChanged:(UISwitch *)sw {
+    keepScreenAwake = sw.on;
+    // 关闭时正在进行的滚动会在 stop 路径里自动还原息屏策略（restoreKeepAwake）
+}
+- (void)cp_editStop {
+    editAutoStopMinutes();
+}
+- (void)cp_toggleDisableApp {
+    BOOL nowDisabled = ![[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
+    [[NSUserDefaults standardUserDefaults] setBool:nowDisabled forKey:disabledKey()];
+    if (cpDisableAppBtn) [cpDisableAppBtn setTitle:(nowDisabled ? @"已禁用此应用（点按启用）" : @"禁用此应用") forState:UIControlStateNormal];
+}
+- (void)cp_close {
+    closeControlPanel();
+}
+@end
+
+static USControlPanelProxy *cpTargetProxy(void) {
+    static USControlPanelProxy *proxy = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{ proxy = [[USControlPanelProxy alloc] init]; });
+    return proxy;
+}
+
 void openSimpleMenu() {
-    if (menuBusy) return;
+    if (menuBusy || controlBackdrop) return;
     UIViewController *presenter = topViewController();
     if (!presenter) return;
-    if ([presenter isKindOfClass:[UIAlertController class]]) return; // 菜单已在最上层
+    if ([presenter isKindOfClass:[UIAlertController class]]) return; // 已有系统弹窗在最上层
     if (presenter.presentedViewController) return;                   // 正在展示别的弹窗
 
+    UIWindow *host = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow && w.windowLevel == UIWindowLevelNormal) { host = w; break; }
+    }
+    if (!host) return;
     menuBusy = YES;
+
+    // 背景：轻遮罩，点击即关
+    controlBackdrop = [[UIView alloc] initWithFrame:host.bounds];
+    controlBackdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.18];
+    controlBackdrop.alpha = 0;
+    // 点击遮罩关闭的手势在末尾统一挂（target = cpTargetProxy，走 cp_close 带动画关闭）
+
+    // 面板：底部半屏卡片
+    controlPanel = [[UIView alloc] initWithFrame:CGRectZero];
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThickMaterial]];
+    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [controlPanel addSubview:blur];
+    controlPanel.layer.cornerRadius = 20.0;
+    controlPanel.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+    controlPanel.layer.masksToBounds = YES;
+
+    UIStackView *stack = [[UIStackView alloc] init];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 6.0;
+    stack.layoutMargins = UIEdgeInsetsMake(4, 16, 16, 16);
+    stack.layoutMarginsRelativeArrangement = YES;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+
+    // 抓手
+    UIView *grabberWrap = [[UIView alloc] init];
+    grabberWrap.translatesAutoresizingMaskIntoConstraints = NO;
+    [grabberWrap.heightAnchor constraintEqualToConstant:14].active = YES;
+    UIView *grab = [[UIView alloc] initWithFrame:CGRectMake(0, 5, 36, 4)];
+    grab.backgroundColor = [UIColor systemGray3Color];
+    grab.layer.cornerRadius = 2.0;
+    grab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+    [grabberWrap addSubview:grab];
+    [stack addArrangedSubview:grabberWrap];
+
+    // 标题 + 状态摘要
+    UIStackView *headRow = [[UIStackView alloc] init];
+    headRow.axis = UILayoutConstraintAxisHorizontal;
+    UILabel *title = [[UILabel alloc] init];
+    title.text = @"UIScroller";
+    title.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
+    title.textColor = [UIColor labelColor];
+    cpSummaryLabel = [[UILabel alloc] init];
+    cpSummaryLabel.font = [UIFont systemFontOfSize:11.0];
+    cpSummaryLabel.textColor = [UIColor secondaryLabelColor];
+    cpSummaryLabel.textAlignment = NSTextAlignmentRight;
+    cpSummaryLabel.text = cpSummaryText();
+    [headRow addArrangedSubview:title];
+    [headRow addArrangedSubview:cpSummaryLabel];
+    [stack addArrangedSubview:headRow];
+
+    // 速度档位
+    [stack addArrangedSubview:cpSectionLabel(@"速度档位")];
+    UISegmentedControl *speedSeg = [[UISegmentedControl alloc] initWithItems:@[@"慢速", @"标准", @"较快", @"快速", @"自动"]];
+    speedSeg.selectedSegmentIndex = (scrollSpeedType >= 0 && scrollSpeedType <= 4) ? scrollSpeedType : 4;
+    [stack addArrangedSubview:speedSeg];
+
+    // 速度微调
+    [stack addArrangedSubview:cpSectionLabel(@"速度微调（固定挡生效）")];
+    UIStackView *sliderRow = [[UIStackView alloc] init];
+    sliderRow.axis = UILayoutConstraintAxisHorizontal;
+    sliderRow.spacing = 10;
+    sliderRow.alignment = UIStackViewAlignmentCenter;
+    UISlider *slider = [[UISlider alloc] init];
+    slider.minimumValue = -100; slider.maximumValue = 100;
+    slider.value = gearSpeedAdjust;
+    cpAdjustValue = [[UILabel alloc] init];
+    cpAdjustValue.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightMedium];
+    cpAdjustValue.textColor = [UIColor systemGreenColor];
+    cpAdjustValue.text = [NSString stringWithFormat:@"%+d pt/s", gearSpeedAdjust];
+    [cpAdjustValue.widthAnchor constraintEqualToConstant:62].active = YES;
+    cpAdjustValue.textAlignment = NSTextAlignmentRight;
+    [sliderRow addArrangedSubview:slider];
+    [sliderRow addArrangedSubview:cpAdjustValue];
+    [stack addArrangedSubview:sliderRow];
+
+    // 力道倍率
+    [stack addArrangedSubview:cpSectionLabel(@"力道倍率（自动档）")];
+    UISegmentedControl *multSeg = [[UISegmentedControl alloc] initWithItems:@[@"0.5×", @"1×", @"1.5×", @"2×"]];
+    multSeg.selectedSegmentIndex = (autoForceMultiplier - 50) / 50; // 50->0 100->1 150->2 200->3
+    if (multSeg.selectedSegmentIndex < 0 || multSeg.selectedSegmentIndex > 3) multSeg.selectedSegmentIndex = 1;
+    [stack addArrangedSubview:multSeg];
+
+    // 屏幕常亮
+    UIStackView *awakeRow = [[UIStackView alloc] init];
+    awakeRow.axis = UILayoutConstraintAxisHorizontal;
+    awakeRow.alignment = UIStackViewAlignmentCenter;
+    UILabel *awakeLabel = [[UILabel alloc] init];
+    awakeLabel.text = @"屏幕常亮";
+    awakeLabel.font = [UIFont systemFontOfSize:13.0];
+    awakeLabel.textColor = [UIColor labelColor];
+    UISwitch *awakeSwitch = [[UISwitch alloc] init];
+    awakeSwitch.on = keepScreenAwake;
+    awakeSwitch.transform = CGAffineTransformMakeScale(0.85, 0.85);
+    [awakeRow addArrangedSubview:awakeLabel];
+    [awakeRow addArrangedSubview:awakeSwitch];
+    [stack addArrangedSubview:awakeRow];
+
+    // 自动停止
+    UIStackView *stopRow = [[UIStackView alloc] init];
+    stopRow.axis = UILayoutConstraintAxisHorizontal;
+    stopRow.alignment = UIStackViewAlignmentCenter;
+    UILabel *stopLabel = [[UILabel alloc] init];
+    stopLabel.text = @"自动停止";
+    stopLabel.font = [UIFont systemFontOfSize:13.0];
+    stopLabel.textColor = [UIColor labelColor];
+    cpAutoStopValue = [[UILabel alloc] init];
+    cpAutoStopValue.font = [UIFont systemFontOfSize:12.0];
+    cpAutoStopValue.textColor = [UIColor secondaryLabelColor];
+    cpAutoStopValue.text = autoDisableMinutes == 0 ? @"关闭" : [NSString stringWithFormat:@"%d 分钟", autoDisableMinutes];
+    cpAutoStopValue.textAlignment = NSTextAlignmentRight;
+    UIButton *editStop = [UIButton buttonWithType:UIButtonTypeSystem];
+    [editStop setTitle:@"编辑" forState:UIControlStateNormal];
+    editStop.titleLabel.font = [UIFont systemFontOfSize:13.0];
+    [stopRow addArrangedSubview:stopLabel];
+    [stopRow addArrangedSubview:cpAutoStopValue];
+    [stopRow addArrangedSubview:editStop];
+    [stack addArrangedSubview:stopRow];
+
+    // 角落手势（左下/右下/关 三段）
+    UIStackView *cornerRow = [[UIStackView alloc] init];
+    cornerRow.axis = UILayoutConstraintAxisHorizontal;
+    cornerRow.alignment = UIStackViewAlignmentCenter;
+    UILabel *cornerLabel = [[UILabel alloc] init];
+    cornerLabel.text = @"角落手势";
+    cornerLabel.font = [UIFont systemFontOfSize:13.0];
+    cornerLabel.textColor = [UIColor labelColor];
+    BOOL cornerOff = [[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()];
+    UISegmentedControl *cornerSeg = [[UISegmentedControl alloc] initWithItems:@[@"左下", @"右下", @"关"]];
+    cornerSeg.selectedSegmentIndex = cornerOff ? 2 : cornerGestureSide;
+    [cornerSeg.widthAnchor constraintEqualToConstant:150].active = YES;
+    [cornerRow addArrangedSubview:cornerLabel];
+    [cornerRow addArrangedSubview:cornerSeg];
+    [stack addArrangedSubview:cornerRow];
+
+    // 禁用此应用（红色整行按钮）
     BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"UIScroller 快捷菜单"
-                                    message:nil
-                                    preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *speed = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"速度：%@", speedName(scrollSpeedType)] style:UIAlertActionStyleDefault
-                                handler:^(UIAlertAction *action) {
-                                    // 直接列出 5 档单选，不用一次 +1 循环点好几次
-                                    UIAlertController *speedSheet = [UIAlertController alertControllerWithTitle:@"选择滚动速度"
-                                                                                                       message:nil
-                                                                                                preferredStyle:UIAlertControllerStyleAlert];
-                                    for (int i = 0; i <= 4; i++) {
-                                        int sel = i; // 每次迭代固定住值，供 block 捕获
-                                        NSString *title = (sel == scrollSpeedType) ?
-                                            [NSString stringWithFormat:@"✓ %@", speedName(sel)] : speedName(sel);
-                                        [speedSheet addAction:[UIAlertAction actionWithTitle:title
-                                                                                       style:UIAlertActionStyleDefault
-                                                                                     handler:^(UIAlertAction *a) {
-                                                                                         scrollSpeedType = sel;
-                                                                                     }]];
-                                    }
-                                    [speedSheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-                                    [topViewController() presentViewController:speedSheet animated:YES completion:nil];
-                                }];
-        UIAlertAction *autoDisable = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"自动停止：%@", autoDisableMinutes == 0 ? @"关闭" : [NSString stringWithFormat:@"%d 分钟", autoDisableMinutes]] style:UIAlertActionStyleDefault
-                                handler:^(UIAlertAction *action) {
-                                    UIAlertController *inputAlert = [UIAlertController alertControllerWithTitle:@"设置自动停止时间"
-                                                                                                      message:@"输入分钟数（0 表示关闭）"
-                                                                                               preferredStyle:UIAlertControllerStyleAlert];
+    cpDisableAppBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    cpDisableAppBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    cpDisableAppBtn.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    [cpDisableAppBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
+    [cpDisableAppBtn setTitle:(isDisabled ? @"已禁用此应用（点按启用）" : @"禁用此应用") forState:UIControlStateNormal];
+    [cpDisableAppBtn.heightAnchor constraintEqualToConstant:34].active = YES;
+    [stack addArrangedSubview:cpDisableAppBtn];
 
-                                    [inputAlert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-                                        textField.keyboardType = UIKeyboardTypeNumberPad;
-                                        textField.placeholder = @"分钟";
-                                        textField.text = [NSString stringWithFormat:@"%d", autoDisableMinutes];
-                                    }];
+    // 布局：stack 填满 blur，面板贴底
+    [blur.contentView addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [stack.topAnchor constraintEqualToAnchor:blur.contentView.topAnchor],
+        [stack.leadingAnchor constraintEqualToAnchor:blur.contentView.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:blur.contentView.trailingAnchor],
+        [stack.bottomAnchor constraintEqualToAnchor:blur.contentView.bottomAnchor],
+    ]];
 
-                                    UIAlertAction *confirmAction = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault
-                                        handler:^(UIAlertAction *action) {
-                                            NSString *input = inputAlert.textFields.firstObject.text;
-                                            int minutes = [input intValue];
-                                            if (minutes < 0) minutes = 0;
-                                            if (minutes > 180) minutes = 180;
-                                            autoDisableMinutes = minutes;
-                                            NSString *message = autoDisableMinutes == 0 ?
-                                                @"已关闭自动停止" :
-                                                [NSString stringWithFormat:@"自动停止时间已设为 %d 分钟", autoDisableMinutes];
-                                            UIAlertController *confirmation = [UIAlertController alertControllerWithTitle:@"设置已更新"
-                                                                                                                message:message
-                                                                                                         preferredStyle:UIAlertControllerStyleAlert];
-                                            [confirmation addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:nil]];
-                                            [topViewController() presentViewController:confirmation animated:YES completion:nil];
-                                        }];
+    CGFloat winW = CGRectGetWidth(host.bounds);
+    CGFloat winH = CGRectGetHeight(host.bounds);
+    CGSize fit = [stack systemLayoutSizeFittingSize:CGSizeMake(winW, UILayoutFittingCompressedSize.height)];
+    CGFloat panelH = fit.height + host.safeAreaInsets.bottom;
 
-                                    UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
-                                    [inputAlert addAction:confirmAction];
-                                    [inputAlert addAction:cancelAction];
-                                    [topViewController() presentViewController:inputAlert animated:YES completion:nil];
-                                }];
-        UIAlertAction *awake = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"屏幕常亮：%@", keepScreenAwake ? @"开" : @"关"] style:UIAlertActionStyleDefault
-                                handler:^(UIAlertAction *action) {
-                                    keepScreenAwake = !keepScreenAwake;
-                                    // 关闭时正在进行的滚动会在 stopUIScroller 里自动还原息屏策略
-                                }];
-        UIAlertAction *toggle = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@此应用", isDisabled ? @"启用" : @"禁用"] style:UIAlertActionStyleDefault
-                                handler:^(UIAlertAction *action) {
-                                    if (isDisabled) [[NSUserDefaults standardUserDefaults] setBool:NO forKey:disabledKey()];
-                                    else [[NSUserDefaults standardUserDefaults] setBool:YES forKey:disabledKey()];
-                                }];
-        BOOL cornerDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()];
-        UIAlertAction *cornerToggle = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"%@角落手势", cornerDisabled ? @"启用" : @"禁用"] style:UIAlertActionStyleDefault
-                                handler:^(UIAlertAction *action) {
-                                    BOOL newDisabled = !cornerDisabled;
-                                    [[NSUserDefaults standardUserDefaults] setBool:newDisabled forKey:cornerDisabledKey()];
-                                    // 关键：同步翻转已挂窗口上的识别器 enabled。只靠 handler 里 early-return
-                                    // 不够 —— 识别器照样识别并把触摸 cancel 掉，App 自己的底部长按就被摸死了。
-                                    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-                                        UILongPressGestureRecognizer *g = objc_getAssociatedObject(w, kCornerGestureKey);
-                                        if (g) g.enabled = !newDisabled;
-                                    }
-                                }];
-        UIAlertAction *gearAdjust = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"速度微调：%+d pt/s", gearSpeedAdjust] style:UIAlertActionStyleDefault
-                                handler:^(UIAlertAction *action) {
-                                    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"固定挡速度微调"
-                                                                                                   message:nil
-                                                                                            preferredStyle:UIAlertControllerStyleAlert];
-                                    int options[] = {-100, -50, -20, 0, 20, 50, 100};
-                                    for (int i = 0; i < 7; i++) {
-                                        int sel = options[i];
-                                        NSString *title = (sel == gearSpeedAdjust) ?
-                                            [NSString stringWithFormat:@"✓ %+d pt/s", sel] :
-                                            [NSString stringWithFormat:@"%+d pt/s", sel];
-                                        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
-                                                                                 handler:^(UIAlertAction *a) { gearSpeedAdjust = sel; }]];
-                                    }
-                                    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-                                    [topViewController() presentViewController:sheet animated:YES completion:nil];
-                                }];
-        UIAlertAction *forceMult = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"力道倍率：%.1f×", autoForceMultiplier / 100.0] style:UIAlertActionStyleDefault
-                                handler:^(UIAlertAction *action) {
-                                    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"选择力道倍率（自动档）"
-                                                                                                   message:nil
-                                                                                            preferredStyle:UIAlertControllerStyleAlert];
-                                    int options[] = {50, 100, 150, 200};
-                                    for (int i = 0; i < 4; i++) {
-                                        int sel = options[i];
-                                        NSString *title = (sel == autoForceMultiplier) ?
-                                            [NSString stringWithFormat:@"✓ %.1f×", sel / 100.0] :
-                                            [NSString stringWithFormat:@"%.1f×", sel / 100.0];
-                                        [sheet addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
-                                                                                 handler:^(UIAlertAction *a) { autoForceMultiplier = sel; }]];
-                                    }
-                                    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-                                    [topViewController() presentViewController:sheet animated:YES completion:nil];
-                                }];
-        UIAlertAction *cornerSide = [UIAlertAction actionWithTitle:[NSString stringWithFormat:@"角落位置：%@", cornerGestureSide == 0 ? @"左下" : @"右下"] style:UIAlertActionStyleDefault
-                                handler:^(UIAlertAction *action) {
-                                    cornerGestureSide = !cornerGestureSide;
-                                }];
-        UIAlertAction *dismiss = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
-        [alert addAction:speed];
-        [alert addAction:gearAdjust];
-        [alert addAction:forceMult];
-        [alert addAction:autoDisable];
-        [alert addAction:awake];
-        [alert addAction:cornerSide];
-        [alert addAction:toggle];
-        [alert addAction:cornerToggle];
-        [alert addAction:dismiss];
-        [presenter presentViewController:alert animated:YES completion:^{
-            menuBusy = NO; // 展示完成后，继续由上面的 presentedViewController 判断拦截
-        }];
-    // 兜底：present 失败时 completion 不会调用，避免 menuBusy 卡住导致菜单再也打不开
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        menuBusy = NO;
-    });
+    blur.frame = CGRectMake(0, 0, winW, panelH);
+    controlPanel.frame = CGRectMake(0, winH, winW, panelH);
+    [host addSubview:controlBackdrop];
+    [host addSubview:controlPanel];
+    [stack layoutIfNeeded];
+    grab.center = CGPointMake(CGRectGetWidth(grabberWrap.bounds) / 2.0, 7); // 布局后再居中（flexible 双边距保持居中）
+
+    // 事件绑定：全部走单例 proxy 分发（见 USControlPanelProxy）
+    USControlPanelProxy *proxy = cpTargetProxy();
+    [speedSeg addTarget:proxy action:@selector(cp_speedChanged:) forControlEvents:UIControlEventValueChanged];
+    [multSeg addTarget:proxy action:@selector(cp_multChanged:) forControlEvents:UIControlEventValueChanged];
+    [cornerSeg addTarget:proxy action:@selector(cp_cornerChanged:) forControlEvents:UIControlEventValueChanged];
+    [slider addTarget:proxy action:@selector(cp_sliderChanged:) forControlEvents:UIControlEventValueChanged];
+    [awakeSwitch addTarget:proxy action:@selector(cp_awakeChanged:) forControlEvents:UIControlEventValueChanged];
+    [editStop addTarget:proxy action:@selector(cp_editStop) forControlEvents:UIControlEventTouchUpInside];
+    [cpDisableAppBtn addTarget:proxy action:@selector(cp_toggleDisableApp) forControlEvents:UIControlEventTouchUpInside];
+
+    // 背景点击关闭（用手势代理挂 selector 到 proxy）
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:cpTargetProxy() action:@selector(cp_close)];
+    [controlBackdrop addGestureRecognizer:tap];
+
+    [UIView animateWithDuration:0.28 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+        controlBackdrop.alpha = 1;
+        controlPanel.frame = CGRectMake(0, winH - panelH, winW, panelH);
+    } completion:nil];
 }
 
 %hook UIWindow
@@ -748,7 +971,7 @@ void openSimpleMenu() {
         NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
             __strong typeof(weakSelf) strongSelf = weakSelf;
             remain--;
-            if (remain <= 10 && remain > 0) updateCountdownHUD(remain);
+            if (remain > 0) updateCountdownHUD(remain); // 胶囊全程可见，≤10s 变琥珀、≤5s 变红
             if (remain <= 0) {
                 hideCountdownHUD();
                 [timer invalidate];
@@ -797,11 +1020,11 @@ void openSimpleMenu() {
         if (autoDisableMinutes > 0) {
             [self stopAutoDisableTimer];
             __block int remain = autoDisableMinutes * 60;
-            // 1 秒一次（不是逐帧）：最后 10 秒才把悬浮窗显示出来，其余时间不打扰阅读
+            // 1 秒一次（不是逐帧）刷新顶部倒计时胶囊
             NSTimer *ad = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer * _Nonnull timer){
                 __strong typeof(weakSelf) strongSelf = weakSelf;
                 remain--;
-                if (remain <= 10 && remain > 0) updateCountdownHUD(remain);
+                if (remain > 0) updateCountdownHUD(remain); // 胶囊全程可见，≤10s 变琥珀、≤5s 变红
                 if (remain <= 0) {
                     hideCountdownHUD();
                     [timer invalidate];
