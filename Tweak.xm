@@ -390,12 +390,33 @@ static void closeControlPanel(void) {
     }];
 }
 
-static UILabel *cpSectionLabel(NSString *text) {
-    UILabel *l = [[UILabel alloc] init];
-    l.text = text;
-    l.font = [UIFont systemFontOfSize:11.0];
-    l.textColor = [UIColor secondaryLabelColor];
-    return l;
+// 卡片容器：圆角背景 + 内边距，把一组控件视觉上归成一块（仿 iOS 设置分组）
+static UIView *cpMakeCard(NSString *title, NSArray<UIView *> *rows) {
+    UIView *card = [[UIView alloc] init];
+    card.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    card.layer.cornerRadius = 14.0;
+    UIStackView *v = [[UIStackView alloc] init];
+    v.axis = UILayoutConstraintAxisVertical;
+    v.spacing = 12.0;
+    v.layoutMargins = UIEdgeInsetsMake(12, 14, 12, 14);
+    v.layoutMarginsRelativeArrangement = YES;
+    v.translatesAutoresizingMaskIntoConstraints = NO;
+    if (title) {
+        UILabel *t = [[UILabel alloc] init];
+        t.text = title;
+        t.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightSemibold];
+        t.textColor = [UIColor secondaryLabelColor];
+        [v addArrangedSubview:t];
+    }
+    for (UIView *row in rows) [v addArrangedSubview:row];
+    [card addSubview:v];
+    [NSLayoutConstraint activateConstraints:@[
+        [v.topAnchor constraintEqualToAnchor:card.topAnchor],
+        [v.leadingAnchor constraintEqualToAnchor:card.leadingAnchor],
+        [v.trailingAnchor constraintEqualToAnchor:card.trailingAnchor],
+        [v.bottomAnchor constraintEqualToAnchor:card.bottomAnchor],
+    ]];
+    return card;
 }
 
 static void editAutoStopMinutes(void) {
@@ -472,6 +493,24 @@ static void editAutoStopMinutes(void) {
 - (void)cp_close {
     closeControlPanel();
 }
+- (void)cp_pan:(UIPanGestureRecognizer *)pan {
+    UIView *panel = controlPanel;
+    if (!panel) return;
+    CGFloat ty = [pan translationInView:panel].y;
+    if (pan.state == UIGestureRecognizerStateChanged) {
+        CGFloat ny = ty;
+        if (ny < 0) ny = ny * 0.15; // 上拉加阻尼，避免误触
+        panel.transform = CGAffineTransformMakeTranslation(0, ny);
+    } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
+        if (ty > 60 || [pan velocityInView:panel].y > 600) {
+            [self cp_close];
+        } else {
+            [UIView animateWithDuration:0.25 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
+                panel.transform = CGAffineTransformIdentity;
+            } completion:nil];
+        }
+    }
+}
 @end
 
 static USControlPanelProxy *cpTargetProxy(void) {
@@ -506,52 +545,57 @@ void openSimpleMenu() {
     UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThickMaterial]];
     blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     [controlPanel addSubview:blur];
-    controlPanel.layer.cornerRadius = 20.0;
+    controlPanel.layer.cornerRadius = 22.0;
     controlPanel.layer.maskedCorners = kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
     controlPanel.layer.masksToBounds = YES;
+    controlPanel.layer.borderWidth = 0.5;
+    controlPanel.layer.borderColor = [[UIColor separatorColor] colorWithAlphaComponent:0.3].CGColor;
 
     UIStackView *stack = [[UIStackView alloc] init];
     stack.axis = UILayoutConstraintAxisVertical;
-    stack.spacing = 6.0;
-    stack.layoutMargins = UIEdgeInsetsMake(4, 16, 16, 16);
+    stack.spacing = 12.0;
+    stack.layoutMargins = UIEdgeInsetsMake(12, 12, 8, 12);
     stack.layoutMarginsRelativeArrangement = YES;
     stack.translatesAutoresizingMaskIntoConstraints = NO;
 
-    // 抓手
+    // 抓手（胶囊）
     UIView *grabberWrap = [[UIView alloc] init];
     grabberWrap.translatesAutoresizingMaskIntoConstraints = NO;
-    [grabberWrap.heightAnchor constraintEqualToConstant:14].active = YES;
-    UIView *grab = [[UIView alloc] initWithFrame:CGRectMake(0, 5, 36, 4)];
-    grab.backgroundColor = [UIColor systemGray3Color];
-    grab.layer.cornerRadius = 2.0;
-    grab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+    [grabberWrap.heightAnchor constraintEqualToConstant:16].active = YES;
+    UIView *grab = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 38, 5)];
+    grab.backgroundColor = [UIColor systemGray4Color];
+    grab.layer.cornerRadius = 2.5;
+    grab.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin
+                          | UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
     [grabberWrap addSubview:grab];
     [stack addArrangedSubview:grabberWrap];
 
-    // 标题 + 状态摘要
+    // 标题栏：标题 + 状态摘要 + 完成按钮
     UIStackView *headRow = [[UIStackView alloc] init];
     headRow.axis = UILayoutConstraintAxisHorizontal;
+    headRow.spacing = 8;
     UILabel *title = [[UILabel alloc] init];
     title.text = @"UIScroller";
-    title.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightSemibold];
+    title.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightBold];
     title.textColor = [UIColor labelColor];
     cpSummaryLabel = [[UILabel alloc] init];
     cpSummaryLabel.font = [UIFont systemFontOfSize:11.0];
     cpSummaryLabel.textColor = [UIColor secondaryLabelColor];
     cpSummaryLabel.textAlignment = NSTextAlignmentRight;
     cpSummaryLabel.text = cpSummaryText();
+    UIButton *doneBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    [doneBtn setTitle:@"完成" forState:UIControlStateNormal];
+    doneBtn.titleLabel.font = [UIFont systemFontOfSize:15.0 weight:UIFontWeightMedium];
     [headRow addArrangedSubview:title];
     [headRow addArrangedSubview:cpSummaryLabel];
+    [headRow addArrangedSubview:doneBtn];
     [stack addArrangedSubview:headRow];
 
     // 速度档位
-    [stack addArrangedSubview:cpSectionLabel(@"速度档位")];
     UISegmentedControl *speedSeg = [[UISegmentedControl alloc] initWithItems:@[@"慢速", @"标准", @"较快", @"快速", @"自动"]];
     speedSeg.selectedSegmentIndex = (scrollSpeedType >= 0 && scrollSpeedType <= 4) ? scrollSpeedType : 4;
-    [stack addArrangedSubview:speedSeg];
 
     // 速度微调
-    [stack addArrangedSubview:cpSectionLabel(@"速度微调（固定挡生效）")];
     UIStackView *sliderRow = [[UIStackView alloc] init];
     sliderRow.axis = UILayoutConstraintAxisHorizontal;
     sliderRow.spacing = 10;
@@ -567,29 +611,13 @@ void openSimpleMenu() {
     cpAdjustValue.textAlignment = NSTextAlignmentRight;
     [sliderRow addArrangedSubview:slider];
     [sliderRow addArrangedSubview:cpAdjustValue];
-    [stack addArrangedSubview:sliderRow];
+
+    UIView *speedCard = cpMakeCard(@"速度", @[speedSeg, sliderRow]);
 
     // 力道倍率
-    [stack addArrangedSubview:cpSectionLabel(@"力道倍率（自动档）")];
     UISegmentedControl *multSeg = [[UISegmentedControl alloc] initWithItems:@[@"0.5×", @"1×", @"1.5×", @"2×"]];
     multSeg.selectedSegmentIndex = (autoForceMultiplier - 50) / 50; // 50->0 100->1 150->2 200->3
     if (multSeg.selectedSegmentIndex < 0 || multSeg.selectedSegmentIndex > 3) multSeg.selectedSegmentIndex = 1;
-    [stack addArrangedSubview:multSeg];
-
-    // 屏幕常亮
-    UIStackView *awakeRow = [[UIStackView alloc] init];
-    awakeRow.axis = UILayoutConstraintAxisHorizontal;
-    awakeRow.alignment = UIStackViewAlignmentCenter;
-    UILabel *awakeLabel = [[UILabel alloc] init];
-    awakeLabel.text = @"屏幕常亮";
-    awakeLabel.font = [UIFont systemFontOfSize:13.0];
-    awakeLabel.textColor = [UIColor labelColor];
-    UISwitch *awakeSwitch = [[UISwitch alloc] init];
-    awakeSwitch.on = keepScreenAwake;
-    awakeSwitch.transform = CGAffineTransformMakeScale(0.85, 0.85);
-    [awakeRow addArrangedSubview:awakeLabel];
-    [awakeRow addArrangedSubview:awakeSwitch];
-    [stack addArrangedSubview:awakeRow];
 
     // 自动停止
     UIStackView *stopRow = [[UIStackView alloc] init];
@@ -610,7 +638,22 @@ void openSimpleMenu() {
     [stopRow addArrangedSubview:stopLabel];
     [stopRow addArrangedSubview:cpAutoStopValue];
     [stopRow addArrangedSubview:editStop];
-    [stack addArrangedSubview:stopRow];
+
+    UIView *autoCard = cpMakeCard(@"自动停止 · 力道", @[multSeg, stopRow]);
+
+    // 屏幕常亮
+    UIStackView *awakeRow = [[UIStackView alloc] init];
+    awakeRow.axis = UILayoutConstraintAxisHorizontal;
+    awakeRow.alignment = UIStackViewAlignmentCenter;
+    UILabel *awakeLabel = [[UILabel alloc] init];
+    awakeLabel.text = @"屏幕常亮";
+    awakeLabel.font = [UIFont systemFontOfSize:13.0];
+    awakeLabel.textColor = [UIColor labelColor];
+    UISwitch *awakeSwitch = [[UISwitch alloc] init];
+    awakeSwitch.on = keepScreenAwake;
+    awakeSwitch.transform = CGAffineTransformMakeScale(0.85, 0.85);
+    [awakeRow addArrangedSubview:awakeLabel];
+    [awakeRow addArrangedSubview:awakeSwitch];
 
     // 角落手势（左下/右下/关 三段）
     UIStackView *cornerRow = [[UIStackView alloc] init];
@@ -626,16 +669,23 @@ void openSimpleMenu() {
     [cornerSeg.widthAnchor constraintEqualToConstant:150].active = YES;
     [cornerRow addArrangedSubview:cornerLabel];
     [cornerRow addArrangedSubview:cornerSeg];
-    [stack addArrangedSubview:cornerRow];
 
-    // 禁用此应用（红色整行按钮）
+    UIView *miscCard = cpMakeCard(@"显示 · 手势", @[awakeRow, cornerRow]);
+
+    [stack addArrangedSubview:speedCard];
+    [stack addArrangedSubview:autoCard];
+    [stack addArrangedSubview:miscCard];
+
+    // 禁用此应用：红色药丸按钮
     BOOL isDisabled = [[NSUserDefaults standardUserDefaults] boolForKey:disabledKey()];
     cpDisableAppBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    cpDisableAppBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-    cpDisableAppBtn.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightMedium];
+    cpDisableAppBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+    cpDisableAppBtn.layer.cornerRadius = 12.0;
+    cpDisableAppBtn.titleLabel.font = [UIFont systemFontOfSize:14.0 weight:UIFontWeightSemibold];
     [cpDisableAppBtn setTitleColor:[UIColor systemRedColor] forState:UIControlStateNormal];
     [cpDisableAppBtn setTitle:(isDisabled ? @"已禁用此应用（点按启用）" : @"禁用此应用") forState:UIControlStateNormal];
-    [cpDisableAppBtn.heightAnchor constraintEqualToConstant:34].active = YES;
+    cpDisableAppBtn.backgroundColor = [[UIColor systemRedColor] colorWithAlphaComponent:0.12];
+    [cpDisableAppBtn.heightAnchor constraintEqualToConstant:44].active = YES;
     [stack addArrangedSubview:cpDisableAppBtn];
 
     // 布局：彻底放弃手动测量，改用 Auto Layout 内容驱动高度。
@@ -680,7 +730,7 @@ void openSimpleMenu() {
     [controlPanel layoutIfNeeded];
 
     // 抓手居中（此时 grabberWrap 已铺到 stack 实际宽度）
-    grab.center = CGPointMake(CGRectGetWidth(grabberWrap.bounds) / 2.0, 7);
+    grab.center = CGPointMake(CGRectGetWidth(grabberWrap.bounds) / 2.0, 8);
 
     // 初始位置：面板整体下移到刚好藏到屏幕下方，然后动画上滑
     controlPanel.transform = CGAffineTransformMakeTranslation(0, CGRectGetHeight(controlPanel.bounds));
@@ -693,7 +743,12 @@ void openSimpleMenu() {
     [slider addTarget:proxy action:@selector(cp_sliderChanged:) forControlEvents:UIControlEventValueChanged];
     [awakeSwitch addTarget:proxy action:@selector(cp_awakeChanged:) forControlEvents:UIControlEventValueChanged];
     [editStop addTarget:proxy action:@selector(cp_editStop) forControlEvents:UIControlEventTouchUpInside];
+    [doneBtn addTarget:proxy action:@selector(cp_close) forControlEvents:UIControlEventTouchUpInside];
     [cpDisableAppBtn addTarget:proxy action:@selector(cp_toggleDisableApp) forControlEvents:UIControlEventTouchUpInside];
+    // 标题栏区域下拉关闭（带阻尼；上拉不跟手，避免误触）
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:proxy action:@selector(cp_pan:)];
+    pan.cancelsTouchesInView = NO;
+    [headRow addGestureRecognizer:pan];
 
     // 背景点击关闭（用手势代理挂 selector 到 proxy）
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:cpTargetProxy() action:@selector(cp_close)];
