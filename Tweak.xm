@@ -771,7 +771,25 @@ void openSimpleMenu() {
     } completion:nil];
 }
 
+@interface UIWindow (UIScrollerCornerDelegate) <UIGestureRecognizerDelegate>
+@end
+
 %hook UIWindow
+
+    - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
+        // 只拦截我们自己的角落长按：落点不在角落扇形内（或已禁用）时立刻返回 NO，
+        // 识别器直接失败，不会 cancel 系统长按（微信/TG 消息菜单、文字选择等）——
+        // 这正是「长按消息不出菜单 / TG 快捷菜单卡住」的根因：之前只在 handler 里 early-return，
+        // 但识别器已经 begin 并 cancel 了触摸，系统长按被掐掉。
+        if (gestureRecognizer == objc_getAssociatedObject(self, kCornerGestureKey)) {
+            if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) return NO;
+            CGPoint p = [gestureRecognizer locationInView:self];
+            CGFloat dx = (cornerGestureSide == 1) ? (CGRectGetWidth(self.bounds) - p.x) : p.x;
+            CGFloat dy = p.y - CGRectGetHeight(self.bounds);
+            if (sqrt(dx * dx + dy * dy) > (CGFloat)kMenuCornerRadius) return NO;
+        }
+        return YES;
+    }
 
     - (void)becomeKeyWindow {
         %orig;
@@ -788,6 +806,11 @@ void openSimpleMenu() {
         cornerGesture.numberOfTouchesRequired = 1;
         cornerGesture.minimumPressDuration = kMenuCornerHold;
         cornerGesture.enabled = ![[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()];
+        // 关键：把识别器委托给 window 自己，让 gestureRecognizerShouldBegin: 在「开始识别」前先裁决。
+        // 落点不在角落扇形内（或已禁用）时返回 NO，识别器直接失败、不会 cancel 系统长按
+        // —— 这正是「微信消息长按不出菜单 / TG 快捷菜单卡住」的根因：之前只在 handler 里 early-return，
+        // 但识别器已经 begin 并 cancel 了触摸，系统长按被掐掉。
+        cornerGesture.delegate = self;
         [self addGestureRecognizer:cornerGesture];
         objc_setAssociatedObject(self, kCornerGestureKey, cornerGesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kMenuAddedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
