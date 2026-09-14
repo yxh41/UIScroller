@@ -69,6 +69,7 @@ static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 // ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
 static const void *kAutoActiveKey       = &kAutoActiveKey;
 static const void *kCornerGestureKey    = &kCornerGestureKey;
+static const void *kThreeFingerGestureKey = &kThreeFingerGestureKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
 static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
 static const void *kAutoLastYKey        = &kAutoLastYKey;
@@ -202,6 +203,11 @@ static NSString *disabledKey() {
 static NSString *cornerDisabledKey() {
     NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
     return [NSString stringWithFormat:@"uiscroller_corner_disabled_%@", bid];
+}
+
+// 三指长按菜单手势的全局禁用 key（三指交互冲突概率低，且用户可全局一键关；不涉及 per-app）
+static NSString *threeFingerDisabledKey() {
+    return @"uiscroller_threefinger_disabled";
 }
 
 // 判断 scroll view 是否在 WKWebView/UIWebView 内部（往 WKScrollView 上挂 tap 会让网页输入框点不动）
@@ -403,7 +409,8 @@ static UIButton          *cpDisableAppBtn = nil;
 static NSString *cpSummaryText(void) {
     NSString *corner = [[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()] ? @"角落关"
                        : (cornerGestureSide == 0 ? @"左下" : @"右下");
-    return [NSString stringWithFormat:@"%@ · %.1f× · %@", speedName(scrollSpeedType), autoForceMultiplier / 100.0, corner];
+    NSString *three = [[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()] ? @"三指关" : @"三指";
+    return [NSString stringWithFormat:@"%@ · %.1f× · %@ · %@", speedName(scrollSpeedType), autoForceMultiplier / 100.0, corner, three];
 }
 
 static void cpRefreshSummary(void) {
@@ -416,6 +423,16 @@ static void cpSetCornerEnabled(BOOL enabled) {
     [[NSUserDefaults standardUserDefaults] setBool:(!enabled) forKey:cornerDisabledKey()];
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
         UILongPressGestureRecognizer *g = objc_getAssociatedObject(w, kCornerGestureKey);
+        if (g) g.enabled = enabled;
+    }
+}
+
+// 三指手势开关（全局）：同步写偏好 + 翻转所有已挂窗口识别器的 enabled
+// （enabled=NO 才是真禁用，handler 里 early-return 挡不住触摸被 cancel）
+static void cpSetThreeFingerEnabled(BOOL enabled) {
+    [[NSUserDefaults standardUserDefaults] setBool:(!enabled) forKey:threeFingerDisabledKey()];
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        UILongPressGestureRecognizer *g = objc_getAssociatedObject(w, kThreeFingerGestureKey);
         if (g) g.enabled = enabled;
     }
 }
@@ -498,6 +515,7 @@ static void editAutoStopMinutes(void) {
 - (void)cp_speedChanged:(UISegmentedControl *)seg;
 - (void)cp_multChanged:(UISegmentedControl *)seg;
 - (void)cp_cornerChanged:(UISegmentedControl *)seg;
+- (void)cp_threeFingerChanged:(UISwitch *)sw;
 - (void)cp_sliderChanged:(UISlider *)slider;
 - (void)cp_awakeChanged:(UISwitch *)sw;
 - (void)cp_editStop;
@@ -521,6 +539,10 @@ static void editAutoStopMinutes(void) {
         cornerGestureSide = (int)seg.selectedSegmentIndex;
         cpSetCornerEnabled(YES); // 切位置顺手把"关"状态解开
     }
+    cpRefreshSummary();
+}
+- (void)cp_threeFingerChanged:(UISwitch *)sw {
+    cpSetThreeFingerEnabled(sw.on);
     cpRefreshSummary();
 }
 - (void)cp_sliderChanged:(UISlider *)slider {
@@ -726,7 +748,21 @@ void openSimpleMenu() {
     [cornerRow addArrangedSubview:cornerLabel];
     [cornerRow addArrangedSubview:cornerSeg];
 
-    UIView *miscCard = cpMakeCard(@"显示 · 手势", @[awakeRow, cornerRow]);
+    // 三指长按菜单（全局开关：防止与 App 自身三指手势冲突，需要时关掉）
+    UIStackView *threeFingerRow = [[UIStackView alloc] init];
+    threeFingerRow.axis = UILayoutConstraintAxisHorizontal;
+    threeFingerRow.alignment = UIStackViewAlignmentCenter;
+    UILabel *threeFingerLabel = [[UILabel alloc] init];
+    threeFingerLabel.text = @"三指菜单";
+    threeFingerLabel.font = [UIFont systemFontOfSize:13.0];
+    threeFingerLabel.textColor = [UIColor labelColor];
+    UISwitch *threeFingerSwitch = [[UISwitch alloc] init];
+    threeFingerSwitch.on = ![[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()];
+    threeFingerSwitch.transform = CGAffineTransformMakeScale(0.85, 0.85);
+    [threeFingerRow addArrangedSubview:threeFingerLabel];
+    [threeFingerRow addArrangedSubview:threeFingerSwitch];
+
+    UIView *miscCard = cpMakeCard(@"显示 · 手势", @[awakeRow, cornerRow, threeFingerRow]);
 
     [stack addArrangedSubview:speedCard];
     [stack addArrangedSubview:autoCard];
@@ -797,6 +833,7 @@ void openSimpleMenu() {
     [speedSeg addTarget:proxy action:@selector(cp_speedChanged:) forControlEvents:UIControlEventValueChanged];
     [multSeg addTarget:proxy action:@selector(cp_multChanged:) forControlEvents:UIControlEventValueChanged];
     [cornerSeg addTarget:proxy action:@selector(cp_cornerChanged:) forControlEvents:UIControlEventValueChanged];
+    [threeFingerSwitch addTarget:proxy action:@selector(cp_threeFingerChanged:) forControlEvents:UIControlEventValueChanged];
     [slider addTarget:proxy action:@selector(cp_sliderChanged:) forControlEvents:UIControlEventValueChanged];
     [awakeSwitch addTarget:proxy action:@selector(cp_awakeChanged:) forControlEvents:UIControlEventValueChanged];
     [editStop addTarget:proxy action:@selector(cp_editStop) forControlEvents:UIControlEventTouchUpInside];
@@ -848,7 +885,13 @@ void openSimpleMenu() {
         if (self.windowLevel != UIWindowLevelNormal) return;
         UILongPressGestureRecognizer *menuGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
         menuGestureRecognizer.numberOfTouchesRequired = 3;
+        // 不吞触摸：handler 只在 Began 弹菜单，不需要消费触摸。设 NO 后 App 自己的三指手势照常收事件，
+        // 不再被 cancel（之前默认 YES 会在 begin 时掐掉并行 App 三指手势 —— 修复 Risk 1）。
+        menuGestureRecognizer.cancelsTouchesInView = NO;
+        // 全局开关：从偏好读初始 enabled，运行时由 cpSetThreeFingerEnabled 翻转所有已挂窗口
+        menuGestureRecognizer.enabled = ![[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()];
         [self addGestureRecognizer:menuGestureRecognizer];
+        objc_setAssociatedObject(self, kThreeFingerGestureKey, menuGestureRecognizer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         // 左下角长按：单指按住 0.6s，比三指长按好按且几乎不会误触（见 handleCornerLongPress 内守卫）。
         // enabled 必须跟 per-app 开关同步：识别器只要 enabled 且识别成功就会 cancel 触摸，
         // 仅在 handler 里 early-return 挡不住"App 底部长按被摸死"的问题。
