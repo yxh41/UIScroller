@@ -260,6 +260,25 @@ id topViewController() {
     else return rootController;
 }
 
+// ── 专用覆盖窗口：承载控制面板 / 菜单，确保位于所有 App 窗口之上并能真正接收触摸 ──
+// 某些 App（典型如 Telegram）会在普通内容窗口之上再叠一个透明 overlay 窗口做自身 UI/手势分发：
+// 面板 add 到 App 的 key window 时，会"看得见"（透过透明层）却"点不动"（触摸被最顶层 overlay 截走）。
+// 用独立的高 level 窗口承载面板即可彻底解决。windowLevel = Alert-1 高于一切 App 内容窗口、低于系统 alert。
+// 注意：不调用 makeKeyWindow，保持 App 原 key window 不变，避免抢走 firstResponder / 键盘。
+static UIWindow *uscOverlayWindow(void) {
+    static UIWindow *w = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        w = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        w.windowLevel = UIWindowLevelAlert - 1.0;
+        w.rootViewController = [[UIViewController alloc] init];
+        w.backgroundColor = [UIColor clearColor];
+        w.userInteractionEnabled = YES;
+        w.hidden = YES;
+    });
+    return w;
+}
+
 // ── 自动停止倒计时胶囊 ──
 // 顶部居中毛玻璃胶囊：滚动期间全程半透明显示 mm:ss（不打扰阅读），
 // 最后 10 秒变实 + 变色（≤10 琥珀、≤5 红）+ 每秒轻微脉冲。
@@ -391,6 +410,7 @@ static void closeControlPanel(void) {
     } completion:^(BOOL finished) {
         [backdrop removeFromSuperview];
         [panel removeFromSuperview];
+        uscOverlayWindow().hidden = YES; // 面板关闭后把覆盖窗口藏起来，交还 App 触摸
         // 面板已销毁，静态控件引用一并置空，防止悬垂指针
         cpSummaryLabel = nil; cpAdjustValue = nil; cpAutoStopValue = nil; cpDisableAppBtn = nil;
         menuBusy = NO;
@@ -444,7 +464,11 @@ static void editAutoStopMinutes(void) {
     }];
     [inputAlert addAction:confirm];
     [inputAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    UIViewController *vc = topViewController();
+    // 编辑弹窗优先挂在我们的覆盖窗口上（它位于最顶层），否则会落在 App 窗口之下被面板遮住
+    UIViewController *vc = nil;
+    UIWindow *ov = uscOverlayWindow();
+    if (ov && !ov.hidden) vc = ov.rootViewController;
+    if (!vc) vc = topViewController();
     if (vc) [vc presentViewController:inputAlert animated:YES completion:nil];
 }
 
@@ -534,15 +558,14 @@ void openSimpleMenu() {
     if ([presenter isKindOfClass:[UIAlertController class]]) return; // 已有系统弹窗在最上层
     if (presenter.presentedViewController) return;                   // 正在展示别的弹窗
 
-    UIWindow *host = nil;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.isKeyWindow && w.windowLevel == UIWindowLevelNormal) { host = w; break; }
-    }
-    if (!host) return;
+    // 用专用高 level 覆盖窗口承载面板（见 uscOverlayWindow），避免被 App 自身的透明 overlay
+    // 窗口挡在前面导致面板"看得见却点不动"（Telegram 等 App 的典型表现）。
+    UIView *container = uscOverlayWindow().rootViewController.view;
+    uscOverlayWindow().hidden = NO;
     menuBusy = YES;
 
     // 背景：轻遮罩，点击即关
-    controlBackdrop = [[UIView alloc] initWithFrame:host.bounds];
+    controlBackdrop = [[UIView alloc] initWithFrame:container.bounds];
     controlBackdrop.backgroundColor = [UIColor colorWithWhite:0 alpha:0.18];
     controlBackdrop.alpha = 0;
     // 点击遮罩关闭的手势在末尾统一挂（target = cpTargetProxy，走 cp_close 带动画关闭）
@@ -703,8 +726,8 @@ void openSimpleMenu() {
     controlPanel.translatesAutoresizingMaskIntoConstraints = NO;
     blur.translatesAutoresizingMaskIntoConstraints = NO;
 
-    [host addSubview:controlBackdrop];
-    [host addSubview:controlPanel];
+    [container addSubview:controlBackdrop];
+    [container addSubview:controlPanel];
 
     // blur 铺满 panel
     [controlPanel addSubview:blur];
@@ -724,12 +747,12 @@ void openSimpleMenu() {
         [stack.bottomAnchor constraintEqualToAnchor:blur.contentView.safeAreaLayoutGuide.bottomAnchor],
     ]];
 
-    // 面板宽度铺满 host，底部贴 host 底；高度由内容决定（顶部不钉），加 90% 屏高上限兜底
+    // 面板宽度铺满覆盖窗口，底部贴其安全区底；高度由内容决定（顶部不钉），加 90% 屏高上限兜底
     [NSLayoutConstraint activateConstraints:@[
-        [controlPanel.leadingAnchor constraintEqualToAnchor:host.leadingAnchor],
-        [controlPanel.trailingAnchor constraintEqualToAnchor:host.trailingAnchor],
-        [controlPanel.bottomAnchor constraintEqualToAnchor:host.bottomAnchor],
-        [controlPanel.heightAnchor constraintLessThanOrEqualToAnchor:host.heightAnchor multiplier:0.9],
+        [controlPanel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [controlPanel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [controlPanel.bottomAnchor constraintEqualToAnchor:container.safeAreaLayoutGuide.bottomAnchor],
+        [controlPanel.heightAnchor constraintLessThanOrEqualToAnchor:container.heightAnchor multiplier:0.9],
     ]];
 
     // 立即 layout，让 Auto Layout 算出内容真实高度
