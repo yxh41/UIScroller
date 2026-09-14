@@ -39,6 +39,18 @@
 }
 @end
 
+// 三指长按菜单识别器：重写 touchesCancelled: 忽略系统取消（典型来自 UIScrollView 滚动时
+// 经响应链发到 window 的触摸取消），避免"在可滚动列表(如设置 App)里三指长按被滚动误杀"。
+// 仅忽略取消、不调用 super，手势会持续跟踪直到手指真正抬起(touchesEnded) 为止。
+@interface USCThreeFingerRecognizer : UILongPressGestureRecognizer
+@end
+@implementation USCThreeFingerRecognizer
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    // 故意不调用 [super touchesCancelled:...]，使滚动造成的触摸取消不会让本手势失败；
+    // 手指真正离开时 touchesEnded 仍会正常触发，手势据此进入 Ended/Cancelled。
+}
+@end
+
 // per-instance 状态存在 associated object 上，避免全局单例导致的：
 //   1) NSTimer 强引用 UIScrollView 造成的对象泄漏
 //   2) 多个 scroll view 共用一个 timer 互相串扰
@@ -254,16 +266,26 @@ id topViewController() {
     UIViewController *rootController = keyWindow.rootViewController;
     UIViewController *topController = rootController;
     while (topController.presentedViewController) topController = topController.presentedViewController;
-    if ([topController isKindOfClass:[UITabBarController class]]) {
-        UIViewController *selected = ((UITabBarController *)topController).selectedViewController;
-        if (selected) topController = selected;
+    // 逐层下钻到真正可见的叶子 VC。支持 UITabBarController / UINavigationController /
+    // UISplitViewController 任意嵌套（设置、邮件、备忘录等系统 App 用 UISplitViewController，
+    // 之前只处理前两种，导致在这些 App 里菜单挂到了错误的 VC 上）。
+    BOOL descended = YES;
+    while (descended) {
+        descended = NO;
+        if ([topController isKindOfClass:[UITabBarController class]]) {
+            UIViewController *sel = ((UITabBarController *)topController).selectedViewController;
+            if (sel && sel != topController) { topController = sel; descended = YES; }
+        } else if ([topController isKindOfClass:[UINavigationController class]]) {
+            UIViewController *vis = ((UINavigationController *)topController).visibleViewController;
+            if (vis && vis != topController) { topController = vis; descended = YES; }
+        } else if ([topController isKindOfClass:[UISplitViewController class]]) {
+            NSArray *vcs = ((UISplitViewController *)topController).viewControllers;
+            // 优先取 secondary（detail 栏，iPhone 上通常是当前可见那一屏），其次 primary，再末位兜底
+            UIViewController *picked = (vcs.count >= 2) ? vcs[1] : (vcs.count == 1 ? vcs[0] : nil);
+            if (picked && picked != topController) { topController = picked; descended = YES; }
+        }
     }
-    if ([topController isKindOfClass:[UINavigationController class]]) {
-        UIViewController *visibleController = ((UINavigationController *)topController).visibleViewController;
-        if (visibleController) topController = visibleController;
-    }
-    if (topController != rootController) return topController;
-    else return rootController;
+    return topController;
 }
 
 // ── 专用覆盖窗口：承载控制面板 / 菜单，确保位于所有 App 窗口之上并能真正接收触摸 ──
@@ -922,13 +944,25 @@ void openSimpleMenu() {
         return NO;
     }
 
+    // 防御：任何手势都不应"require 我们的三指手势先失败"，否则会反过来把我们的手势卡住
+    // （设置等 App 内部手势的依赖关系 simultaneous 无法覆盖）。返回 NO = 我们的三指手势
+    // 不被其它手势的 requireToFail 约束。
+    - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+        UIGestureRecognizer *tf = objc_getAssociatedObject(self, kThreeFingerGestureKey);
+        if (gestureRecognizer == tf) return NO;
+        return NO;
+    }
+
     - (void)becomeKeyWindow {
         %orig;
         if (objc_getAssociatedObject(self, kMenuAddedKey)) return; // 去重：每个 window 只加一次
         // 只给主窗口（normal level）加菜单手势，避开键盘/弹窗等高 level 窗口
         if (self.windowLevel != UIWindowLevelNormal) return;
-        UILongPressGestureRecognizer *menuGestureRecognizer = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
+        USCThreeFingerRecognizer *menuGestureRecognizer = [[USCThreeFingerRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
         menuGestureRecognizer.numberOfTouchesRequired = 3;
+        // 宽容移动阈值：设置等可滚动列表里三指按住时列表可能轻微滚动，移动过大会让长按时
+        // 判定失败；放宽到 100pt 后只要手指不大幅滑动就能稳定触发。
+        menuGestureRecognizer.allowableMovement = 100.0;
         // 不吞触摸：handler 只在 Began 弹菜单，不需要消费触摸。设 NO 后 App 自己的三指手势照常收事件，
         // 不再被 cancel（之前默认 YES 会在 begin 时掐掉并行 App 三指手势 —— 修复 Risk 1）。
         menuGestureRecognizer.cancelsTouchesInView = NO;
