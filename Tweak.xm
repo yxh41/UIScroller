@@ -305,11 +305,17 @@ static UIView  *hudDot      = nil;
 static UIVisualEffectView *hudBlur = nil; // 毛玻璃背景，单独内缩/圆角，不随胶囊框铺满
 
 static UIView *hudEnsureCapsule(void) {
-    // 必须挂到当前 keyWindow（normal level），否则可能挂到后台的 normal-level 窗口上被盖住
+    // 优先挂到当前 keyWindow（normal level），否则可能挂到后台的 normal-level 窗口上被盖住。
+    // 菜单打开时 key window 是我们的 Alert-1 覆盖窗口，此时没有任何 normal 级 key window，
+    // 于是退回「最上层的可见 normal 窗口」，让倒计时胶囊继续刷新而不是冻住（此前会 return nil）。
     UIWindow *host = nil;
+    UIWindow *fallback = nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.isKeyWindow && w.windowLevel == UIWindowLevelNormal && !w.hidden) { host = w; break; }
+        if (w.hidden || w.windowLevel != UIWindowLevelNormal) continue;
+        fallback = w; // windows 数组大致按层级由下往上，最后命中的即最上层
+        if (w.isKeyWindow) { host = w; break; }
     }
+    if (!host) host = fallback;
     if (!host) return nil;
     // 如果胶囊挂在了别的（非 key/隐藏）窗口上，移除重挂，防止切换 App 后回到旧窗口
     if (hudCapsule && hudCapsule.superview && hudCapsule.superview != host) {
@@ -484,7 +490,19 @@ static UIView *cpMakeCard(NSString *title, NSArray<UIView *> *rows) {
     return card;
 }
 
+// 防重入标志：presentViewController 是异步的，连点"编辑"会在动画未完成时第二次 present，
+// 报 "view is not in window hierarchy"。标志在弹窗被真正关闭（确定/取消 action）时复位。
+static BOOL uscEditAlertBusy = NO;
+
 static void editAutoStopMinutes(void) {
+    if (uscEditAlertBusy) return;
+    // 编辑弹窗优先挂在我们的覆盖窗口上（它位于最顶层），否则会落在 App 窗口之下被面板遮住
+    UIViewController *vc = nil;
+    UIWindow *ov = uscOverlayWindow();
+    if (ov && !ov.hidden) vc = ov.rootViewController;
+    if (!vc) vc = topViewController();
+    if (!vc || vc.presentedViewController) return; // 已有弹窗在展示中
+    uscEditAlertBusy = YES;
     UIAlertController *inputAlert = [UIAlertController alertControllerWithTitle:@"设置自动停止时间"
                                                                         message:@"输入分钟数（0 表示关闭）"
                                                                  preferredStyle:UIAlertControllerStyleAlert];
@@ -494,6 +512,7 @@ static void editAutoStopMinutes(void) {
         textField.text = [NSString stringWithFormat:@"%d", autoDisableMinutes];
     }];
     UIAlertAction *confirm = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        uscEditAlertBusy = NO;
         int minutes = [inputAlert.textFields.firstObject.text intValue];
         if (minutes < 0) minutes = 0;
         if (minutes > 180) minutes = 180;
@@ -501,13 +520,14 @@ static void editAutoStopMinutes(void) {
         if (cpAutoStopValue) cpAutoStopValue.text = minutes == 0 ? @"关闭" : [NSString stringWithFormat:@"%d 分钟", minutes];
     }];
     [inputAlert addAction:confirm];
-    [inputAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    // 编辑弹窗优先挂在我们的覆盖窗口上（它位于最顶层），否则会落在 App 窗口之下被面板遮住
-    UIViewController *vc = nil;
-    UIWindow *ov = uscOverlayWindow();
-    if (ov && !ov.hidden) vc = ov.rootViewController;
-    if (!vc) vc = topViewController();
-    if (vc) [vc presentViewController:inputAlert animated:YES completion:nil];
+    [inputAlert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        uscEditAlertBusy = NO;
+    }]];
+    [vc presentViewController:inputAlert animated:YES completion:nil];
+    // 兜底：若 present 根本没成功（vc 不在窗口层级里），0.6s 后解锁，避免标志永久卡住
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (!vc.presentedViewController) uscEditAlertBusy = NO;
+    });
 }
 
 // ── 面板事件分发：UIControl target-action 需要一个常驻对象接住回调，用单例 proxy ──
@@ -604,16 +624,21 @@ void openSimpleMenu() {
     UIViewController *presenter = topViewController();
     if (!presenter) return;
     if ([presenter isKindOfClass:[UIAlertController class]]) return; // 已有系统弹窗在最上层
-    if (presenter.presentedViewController) return;                   // 正在展示别的弹窗
+    // 只在最上层 presented 是系统弹窗（alert）时才放弃打开：菜单挂在独立顶层覆盖窗口上，
+    // 叠在分享面板/常驻容器 VC 之上是安全的。之前一刀切拦截 presentedViewController，
+    // 导致某些 App（navigation 内 visibleVC 长期 present 着东西）永远触发不了菜单。
+    if ([presenter.presentedViewController isKindOfClass:[UIAlertController class]]) return;
 
     // 用专用高 level 覆盖窗口承载面板（见 uscOverlayWindow），避免被 App 自身的透明 overlay
     // 窗口挡在前面导致面板"看得见却点不动"（Telegram 等 App 的典型表现）。
+    // 先捕获原 key window：此刻覆盖窗口仍是 hidden，绝不可能是 key —— 避免把"上一个 key window"
+    // 记成覆盖窗口自己（那样关闭时会还原给它，App 窗口永远拿不回 key）。
+    uscPrevKeyWindow = uscCurrentKeyWindow();
     UIView *container = uscOverlayWindow().rootViewController.view;
     uscOverlayWindow().hidden = NO;
     // 让覆盖窗口成为 key window：非 key 的高 level 窗口在连续手势（拖拽面板）的触摸投递上
     // 不稳定，表现为"拉着没反应、拉着拉着才跟手"。成为 key 后触摸稳定。
     // 记住原 key window，关闭时还原，不抢 App 的 firstResponder / 键盘。
-    uscPrevKeyWindow = uscCurrentKeyWindow();
     [uscOverlayWindow() makeKeyWindow];
     menuBusy = YES;
 
