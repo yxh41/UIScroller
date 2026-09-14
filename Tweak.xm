@@ -296,6 +296,7 @@ static UIWindow *uscCurrentKeyWindow(void) {
 static UIView  *hudCapsule  = nil;
 static UILabel *hudTimeLabel = nil;
 static UIView  *hudDot      = nil;
+static UIVisualEffectView *hudBlur = nil; // 毛玻璃背景，单独内缩/圆角，不随胶囊框铺满
 
 static UIView *hudEnsureCapsule(void) {
     // 必须挂到当前 keyWindow（normal level），否则可能挂到后台的 normal-level 窗口上被盖住
@@ -312,9 +313,10 @@ static UIView *hudEnsureCapsule(void) {
         hudCapsule = [[UIView alloc] initWithFrame:CGRectZero];
         UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemMaterial]];
         blur.frame = hudCapsule.bounds;
-        blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        blur.autoresizingMask = UIViewAutoresizingNone; // 背景要手动内缩，不能被 autoresizing 重新铺满
         blur.userInteractionEnabled = NO;
         [hudCapsule addSubview:blur];
+        hudBlur = blur;
 
         hudDot = [[UIView alloc] initWithFrame:CGRectZero];
         hudDot.backgroundColor = [UIColor systemGreenColor];
@@ -354,6 +356,14 @@ static void updateCountdownHUD(int seconds) {
     CGFloat cx = CGRectGetWidth(host.bounds) / 2.0;
     cap.frame = CGRectMake(cx - w / 2.0, top, w, h);
     cap.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin | UIViewAutoresizingFlexibleBottomMargin;
+
+    // 毛玻璃背景在胶囊框内上下内缩：刘海/灵动岛正对胶囊水平中心，竖直内缩能明显减小被遮挡面积
+    // （无法 100% 避开中间那块，除非下移/偏移，已按需求保持位置不动）。
+    // 内缩量随设备自适应：有顶部安全区（刘海/灵动岛）缩 7pt，否则缩 3pt。开销可忽略。
+    CGFloat bgInset = (host.safeAreaInsets.top > 20.0) ? 7.0 : 3.0;
+    hudBlur.frame = CGRectInset(cap.bounds, 0, bgInset);
+    hudBlur.layer.cornerRadius = CGRectGetHeight(hudBlur.frame) / 2.0; // 内缩后背景自己保持胶囊形圆角
+    hudBlur.layer.masksToBounds = YES;
     hudDot.frame = CGRectMake(12.0, (h - 8.0) / 2.0, 8.0, 8.0);
     hudTimeLabel.frame = CGRectMake(26.0, (h - CGRectGetHeight(hudTimeLabel.bounds)) / 2.0,
                                     CGRectGetWidth(hudTimeLabel.bounds), CGRectGetHeight(hudTimeLabel.bounds));
