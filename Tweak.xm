@@ -568,6 +568,11 @@ static void editAutoStopMinutes(void) {
     closeControlPanel();
 }
 - (void)cp_pan:(UIPanGestureRecognizer *)pan {
+    // 拖拽开始时再次确认覆盖窗口是 key：万一开菜单后 key 状态被 App 抢回，这里即时补回，
+    // 保证后续 touchesMoved 流稳定（解决"拉手偶尔拉不下 / 拉着才跟手"的残留问题）。
+    if (pan.state == UIGestureRecognizerStateBegan && uscOverlayWindow().hidden == NO && !uscOverlayWindow().isKeyWindow) {
+        [uscOverlayWindow() makeKeyWindow];
+    }
     UIView *panel = controlPanel;
     if (!panel) return;
     CGFloat ty = [pan translationInView:panel].y;
@@ -855,7 +860,12 @@ void openSimpleMenu() {
     [UIView animateWithDuration:0.28 delay:0 options:UIViewAnimationOptionCurveEaseOut animations:^{
         controlBackdrop.alpha = 1;
         controlPanel.transform = CGAffineTransformIdentity;
-    } completion:nil];
+    } completion:^(BOOL finished) {
+        // 打开动画结束后再次确认覆盖窗口是 key：开菜单期间 App 可能在某次事件里把自身窗口重新
+        // key 回来，导致高 level 窗口丢掉 key 状态、连续拖拽手势的 touchesMoved 流不稳
+        // （"拉手下不去 / 拉着拉着才跟手" 的残留抖动）。这里补回，确保用户开始拖时窗口已是 key。
+        if (uscOverlayWindow().hidden == NO) [uscOverlayWindow() makeKeyWindow];
+    }];
 }
 
 @interface UIWindow (UIScrollerCornerDelegate) <UIGestureRecognizerDelegate>
