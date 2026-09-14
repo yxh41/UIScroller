@@ -279,6 +279,16 @@ static UIWindow *uscOverlayWindow(void) {
     return w;
 }
 
+// 记录菜单打开前 App 原本的 key window，关闭时还原（避免抢走 firstResponder / 键盘）。
+static UIWindow *uscPrevKeyWindow = nil;
+// 取当前 key window（不用 deprecated 的 -[UIApplication keyWindow]，避免 theos -Werror 编译失败）
+static UIWindow *uscCurrentKeyWindow(void) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) return w;
+    }
+    return nil;
+}
+
 // ── 自动停止倒计时胶囊 ──
 // 顶部居中毛玻璃胶囊：滚动期间全程半透明显示 mm:ss（不打扰阅读），
 // 最后 10 秒变实 + 变色（≤10 琥珀、≤5 红）+ 每秒轻微脉冲。
@@ -411,6 +421,7 @@ static void closeControlPanel(void) {
         [backdrop removeFromSuperview];
         [panel removeFromSuperview];
         uscOverlayWindow().hidden = YES; // 面板关闭后把覆盖窗口藏起来，交还 App 触摸
+        if (uscPrevKeyWindow) { [uscPrevKeyWindow makeKeyWindow]; uscPrevKeyWindow = nil; } // 还原 App 原 key window
         // 面板已销毁，静态控件引用一并置空，防止悬垂指针
         cpSummaryLabel = nil; cpAdjustValue = nil; cpAutoStopValue = nil; cpDisableAppBtn = nil;
         menuBusy = NO;
@@ -562,6 +573,11 @@ void openSimpleMenu() {
     // 窗口挡在前面导致面板"看得见却点不动"（Telegram 等 App 的典型表现）。
     UIView *container = uscOverlayWindow().rootViewController.view;
     uscOverlayWindow().hidden = NO;
+    // 让覆盖窗口成为 key window：非 key 的高 level 窗口在连续手势（拖拽面板）的触摸投递上
+    // 不稳定，表现为"拉着没反应、拉着拉着才跟手"。成为 key 后触摸稳定。
+    // 记住原 key window，关闭时还原，不抢 App 的 firstResponder / 键盘。
+    uscPrevKeyWindow = uscCurrentKeyWindow();
+    [uscOverlayWindow() makeKeyWindow];
     menuBusy = YES;
 
     // 背景：轻遮罩，点击即关
