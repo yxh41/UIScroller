@@ -888,6 +888,15 @@ void openSimpleMenu() {
         return YES;
     }
 
+    // 让三指菜单长按能和 App 自身的 pan/scroll 等手势并存：否则某些 App 的 pan 会在按下瞬间先
+    // begin，系统据此把我们的三指长按判定为失败 -> "部分 App 三指弹不出菜单"。仅对我们的三指手势放宽，
+    // 且 cancelsTouchesInView 仍为 NO（不取消 App 触摸），避免误伤 App 自己的三指手势（Risk 1 不回潮）。
+    - (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
+        UIGestureRecognizer *tf = objc_getAssociatedObject(self, kThreeFingerGestureKey);
+        if (a == tf || b == tf) return YES;
+        return NO;
+    }
+
     - (void)becomeKeyWindow {
         %orig;
         if (objc_getAssociatedObject(self, kMenuAddedKey)) return; // 去重：每个 window 只加一次
@@ -898,6 +907,9 @@ void openSimpleMenu() {
         // 不吞触摸：handler 只在 Began 弹菜单，不需要消费触摸。设 NO 后 App 自己的三指手势照常收事件，
         // 不再被 cancel（之前默认 YES 会在 begin 时掐掉并行 App 三指手势 —— 修复 Risk 1）。
         menuGestureRecognizer.cancelsTouchesInView = NO;
+        // 关键：把识别器委托给 window 自己，并实现 shouldRecognizeSimultaneouslyWithGestureRecognizer:，
+        // 让三指长按能与 App 的 pan/scroll 并存（否则部分 App 的 pan 抢先 begin 会把我们的长按判定失败）。
+        menuGestureRecognizer.delegate = self;
         // 全局开关：从偏好读初始 enabled，运行时由 cpSetThreeFingerEnabled 翻转所有已挂窗口
         menuGestureRecognizer.enabled = ![[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()];
         [self addGestureRecognizer:menuGestureRecognizer];
