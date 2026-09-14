@@ -763,11 +763,12 @@ void openSimpleMenu() {
         [stack.bottomAnchor constraintEqualToAnchor:blur.contentView.safeAreaLayoutGuide.bottomAnchor],
     ]];
 
-    // 面板宽度铺满覆盖窗口，底部贴其安全区底；高度由内容决定（顶部不钉），加 90% 屏高上限兜底
+    // 面板宽度铺满覆盖窗口，底部贴屏幕最底（home 指示条压在面板上，更现代的 bottom sheet 观感）；
+    // 面板内容仍锚在 safeArea 内缩，不会被 home 指示条挡住。高度由内容决定（顶部不钉），加 90% 屏高上限兜底
     [NSLayoutConstraint activateConstraints:@[
         [controlPanel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
         [controlPanel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
-        [controlPanel.bottomAnchor constraintEqualToAnchor:container.safeAreaLayoutGuide.bottomAnchor],
+        [controlPanel.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
         [controlPanel.heightAnchor constraintLessThanOrEqualToAnchor:container.heightAnchor multiplier:0.9],
     ]];
 
