@@ -2,6 +2,7 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <math.h>
+#include <stdarg.h>
 
 @interface UIScrollView (UIScroller)
 @property (nonatomic,readonly) UIPanGestureRecognizer *panGestureRecognizer;
@@ -39,17 +40,35 @@
 }
 @end
 
-// 三指长按菜单识别器：重写 touchesCancelled: 忽略系统取消（典型来自 UIScrollView 滚动时
-// 经响应链发到 window 的触摸取消），避免"在可滚动列表(如设置 App)里三指长按被滚动误杀"。
-// 仅忽略取消、不调用 super，手势会持续跟踪直到手指真正抬起(touchesEnded) 为止。
-@interface USCThreeFingerRecognizer : UILongPressGestureRecognizer
-@end
-@implementation USCThreeFingerRecognizer
-- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-    // 故意不调用 [super touchesCancelled:...]，使滚动造成的触摸取消不会让本手势失败；
-    // 手指真正离开时 touchesEnded 仍会正常触发，手势据此进入 Ended/Cancelled。
+// ── 调试日志（真机排查用，稳定后移除）──
+// 写入 /var/mobile/Documents/uiscroller_debug.log，用 Filza 等查看。
+static void uscDbg(NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *path = @"/var/mobile/Documents/uiscroller_debug.log";
+    NSString *line = [NSString stringWithFormat:@"[%.3f] %@\n",
+        [[NSDate date] timeIntervalSince1970], msg];
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
+    else { [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
 }
-@end
+
+// ── 三指长按：手动统计按下手指数 + 计时，绕开 UIGestureRecognizer ──
+// UIScrollView 滚动时会向 window 发 touchesCancelled，会让 window 级长按识别器失败
+// （故「设置/备忘录/提醒事项/健康/TestFlight 等可滚动 App 三指弹不出菜单」）。
+// 改为直接在 window 的 touch 事件里手动统计，完全不受取消影响，健壮性远高于手势方案。
+static BOOL uscTFEnabled   = YES;   // 由全局开关控制（threeFingerDisabledKey）
+static BOOL uscTFArmed     = NO;    // 已派发 0.5s 计时器
+static int  uscTFLastCount = 0;     // 最近一次记录到的按下手指数
+static int  uscTFActiveTouches(UIEvent *event) {
+    int n = 0;
+    for (UITouch *t in [event allTouches]) {
+        UITouchPhase p = t.phase;
+        if (p == UITouchPhaseBegan || p == UITouchPhaseMoved || p == UITouchPhaseStationary) n++;
+    }
+    return n;
+}
 
 // per-instance 状态存在 associated object 上，避免全局单例导致的：
 //   1) NSTimer 强引用 UIScrollView 造成的对象泄漏
@@ -285,6 +304,7 @@ id topViewController() {
             if (picked && picked != topController) { topController = picked; descended = YES; }
         }
     }
+    uscDbg(@"topViewController keyWin=%@ root=%@ result=%@", NSStringFromClass([keyWindow class]), NSStringFromClass([rootController class]), NSStringFromClass([topController class]));
     return topController;
 }
 
@@ -459,10 +479,7 @@ static void cpSetCornerEnabled(BOOL enabled) {
 // （enabled=NO 才是真禁用，handler 里 early-return 挡不住触摸被 cancel）
 static void cpSetThreeFingerEnabled(BOOL enabled) {
     [[NSUserDefaults standardUserDefaults] setBool:(!enabled) forKey:threeFingerDisabledKey()];
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        UILongPressGestureRecognizer *g = objc_getAssociatedObject(w, kThreeFingerGestureKey);
-        if (g) g.enabled = enabled;
-    }
+    uscTFEnabled = enabled; // 手动三指检测改用全局开关（不再依赖已移除的 UIGestureRecognizer）
 }
 
 static void closeControlPanel(void) {
@@ -642,14 +659,16 @@ static USControlPanelProxy *cpTargetProxy(void) {
 }
 
 void openSimpleMenu() {
-    if (menuBusy || controlBackdrop) return;
+    uscDbg(@"openSimpleMenu enter menuBusy=%d backdrop=%p", menuBusy, controlBackdrop);
+    if (menuBusy || controlBackdrop) { uscDbg(@"openSimpleMenu abort: already busy/showing"); return; }
     UIViewController *presenter = topViewController();
-    if (!presenter) return;
-    if ([presenter isKindOfClass:[UIAlertController class]]) return; // 已有系统弹窗在最上层
+    uscDbg(@"openSimpleMenu presenter=%@ presented=%@", NSStringFromClass([presenter class]), NSStringFromClass([presenter.presentedViewController class]));
+    if (!presenter) { uscDbg(@"openSimpleMenu abort: no presenter"); return; }
+    if ([presenter isKindOfClass:[UIAlertController class]]) { uscDbg(@"openSimpleMenu abort: presenter is alert"); return; }
     // 只在最上层 presented 是系统弹窗（alert）时才放弃打开：菜单挂在独立顶层覆盖窗口上，
     // 叠在分享面板/常驻容器 VC 之上是安全的。之前一刀切拦截 presentedViewController，
     // 导致某些 App（navigation 内 visibleVC 长期 present 着东西）永远触发不了菜单。
-    if ([presenter.presentedViewController isKindOfClass:[UIAlertController class]]) return;
+    if ([presenter.presentedViewController isKindOfClass:[UIAlertController class]]) { uscDbg(@"openSimpleMenu abort: presenter.presented is alert"); return; }
 
     // 用专用高 level 覆盖窗口承载面板（见 uscOverlayWindow），避免被 App 自身的透明 overlay
     // 窗口挡在前面导致面板"看得见却点不动"（Telegram 等 App 的典型表现）。
@@ -663,6 +682,7 @@ void openSimpleMenu() {
     // 记住原 key window，关闭时还原，不抢 App 的 firstResponder / 键盘。
     [uscOverlayWindow() makeKeyWindow];
     menuBusy = YES;
+    uscDbg(@"openSimpleMenu shown, overlay hidden=%d keyWin=%d", uscOverlayWindow().hidden, uscOverlayWindow().isKeyWindow);
 
     // 背景：轻遮罩，点击即关
     controlBackdrop = [[UIView alloc] initWithFrame:container.bounds];
@@ -926,11 +946,12 @@ void openSimpleMenu() {
         // 这正是「长按消息不出菜单 / TG 快捷菜单卡住」的根因：之前只在 handler 里 early-return，
         // 但识别器已经 begin 并 cancel 了触摸，系统长按被掐掉。
         if (gestureRecognizer == objc_getAssociatedObject(self, kCornerGestureKey)) {
-            if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) return NO;
+            if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) { uscDbg(@"corner shouldBegin=NO (disabled)"); return NO; }
             CGPoint p = [gestureRecognizer locationInView:self];
             CGFloat dx = (cornerGestureSide == 1) ? (CGRectGetWidth(self.bounds) - p.x) : p.x;
             CGFloat dy = p.y - CGRectGetHeight(self.bounds);
-            if (sqrt(dx * dx + dy * dy) > (CGFloat)kMenuCornerRadius) return NO;
+            if (sqrt(dx * dx + dy * dy) > (CGFloat)kMenuCornerRadius) { uscDbg(@"corner shouldBegin=NO (outside fan)"); return NO; }
+            uscDbg(@"corner shouldBegin=YES");
         }
         return YES;
     }
@@ -944,35 +965,15 @@ void openSimpleMenu() {
         return NO;
     }
 
-    // 防御：任何手势都不应"require 我们的三指手势先失败"，否则会反过来把我们的手势卡住
-    // （设置等 App 内部手势的依赖关系 simultaneous 无法覆盖）。返回 NO = 我们的三指手势
-    // 不被其它手势的 requireToFail 约束。
-    - (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldBeRequiredToFailByGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
-        UIGestureRecognizer *tf = objc_getAssociatedObject(self, kThreeFingerGestureKey);
-        if (gestureRecognizer == tf) return NO;
-        return NO;
-    }
-
     - (void)becomeKeyWindow {
         %orig;
         if (objc_getAssociatedObject(self, kMenuAddedKey)) return; // 去重：每个 window 只加一次
         // 只给主窗口（normal level）加菜单手势，避开键盘/弹窗等高 level 窗口
         if (self.windowLevel != UIWindowLevelNormal) return;
-        USCThreeFingerRecognizer *menuGestureRecognizer = [[USCThreeFingerRecognizer alloc] initWithTarget:self action:@selector(handleMenuLongPress:)];
-        menuGestureRecognizer.numberOfTouchesRequired = 3;
-        // 宽容移动阈值：设置等可滚动列表里三指按住时列表可能轻微滚动，移动过大会让长按时
-        // 判定失败；放宽到 100pt 后只要手指不大幅滑动就能稳定触发。
-        menuGestureRecognizer.allowableMovement = 100.0;
-        // 不吞触摸：handler 只在 Began 弹菜单，不需要消费触摸。设 NO 后 App 自己的三指手势照常收事件，
-        // 不再被 cancel（之前默认 YES 会在 begin 时掐掉并行 App 三指手势 —— 修复 Risk 1）。
-        menuGestureRecognizer.cancelsTouchesInView = NO;
-        // 关键：把识别器委托给 window 自己，并实现 shouldRecognizeSimultaneouslyWithGestureRecognizer:，
-        // 让三指长按能与 App 的 pan/scroll 并存（否则部分 App 的 pan 抢先 begin 会把我们的长按判定失败）。
-        menuGestureRecognizer.delegate = self;
-        // 全局开关：从偏好读初始 enabled，运行时由 cpSetThreeFingerEnabled 翻转所有已挂窗口
-        menuGestureRecognizer.enabled = ![[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()];
-        [self addGestureRecognizer:menuGestureRecognizer];
-        objc_setAssociatedObject(self, kThreeFingerGestureKey, menuGestureRecognizer, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 三指长按不再用 UIGestureRecognizer（滚动取消会让 window 级长按失败）；改在 window 的
+        // touch 事件里手动统计手指数（见 %hook UIWindow 的 touches* 重写 + uscTrackThreeFinger:）。
+        // 这里只同步一次全局开关初值。
+        uscTFEnabled = ![[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()];
         // 左下角长按：单指按住 0.6s，比三指长按好按且几乎不会误触（见 handleCornerLongPress 内守卫）。
         // enabled 必须跟 per-app 开关同步：识别器只要 enabled 且识别成功就会 cancel 触摸，
         // 仅在 handler 里 early-return 挡不住"App 底部长按被摸死"的问题。
@@ -1001,6 +1002,7 @@ void openSimpleMenu() {
     %new
     - (void)handleCornerLongPress:(UILongPressGestureRecognizer *)gesture {
         if (gesture.state != UIGestureRecognizerStateBegan) return;
+        uscDbg(@"corner gesture began (fan/passed) state=%ld", (long)gesture.state);
         // per-app 禁用：部分 App 底部角落有自己的长按功能（拖拽排序/清除角标等），
         // 在菜单里关掉角落手势即可 —— 触发频率低，每次读一次 NSUserDefaults 开销可忽略。
         if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) return;
@@ -1012,7 +1014,50 @@ void openSimpleMenu() {
         // 2) 震动反馈（长按没反馈容易不知道有没有用上劲）+ 弹菜单（内部有 menuBusy 防重入）
         UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
         [haptic impactOccurred];
+        uscDbg(@"corner fired (haptic) -> openSimpleMenu");
         openSimpleMenu();
+    }
+
+    // ── 三指长按：手动统计按下的手指数 + 0.5s 计时（绕开 UIGestureRecognizer 的滚动取消）──
+    - (void)uscTrackThreeFinger:(UIEvent *)event {
+        if (!uscTFEnabled) return;
+        if (menuBusy) return; // 菜单已开，避免重复触发
+        int n = uscTFActiveTouches(event);
+        uscTFLastCount = n;
+        if (n >= 3) {
+            if (!uscTFArmed) {
+                uscTFArmed = YES;
+                uscDbg(@"3finger armed, count=%d", n);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                              dispatch_get_main_queue(), ^{
+                    uscTFArmed = NO;
+                    uscDbg(@"3finger timer fired, lastCount=%d enabled=%d busy=%d", uscTFLastCount, uscTFEnabled, menuBusy);
+                    if (uscTFEnabled && !menuBusy && uscTFLastCount >= 3) {
+                        uscDbg(@"3finger -> openSimpleMenu");
+                        openSimpleMenu();
+                    }
+                });
+            }
+        } else {
+            uscTFArmed = NO;
+        }
+    }
+
+    - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+        %orig;
+        [self uscTrackThreeFinger:event];
+    }
+    - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+        %orig;
+        [self uscTrackThreeFinger:event];
+    }
+    - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+        %orig;
+        [self uscTrackThreeFinger:event];
+    }
+    - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+        %orig;
+        [self uscTrackThreeFinger:event];
     }
 
 %end
