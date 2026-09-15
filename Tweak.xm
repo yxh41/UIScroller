@@ -230,9 +230,11 @@ static NSString *cornerDisabledKey() {
     return [NSString stringWithFormat:@"uiscroller_corner_disabled_%@", bid];
 }
 
-// 三指长按菜单手势的全局禁用 key（三指交互冲突概率低，且用户可全局一键关；不涉及 per-app）
+// 三指长按菜单手势的 per-app 禁用 key：与角落手势一致，按 App 单独开关。
+// 三指交互冲突概率比角落低，但某些 App 自身有三指手势（如三指撤销/缩放），仍可能误触，故同样支持按 App 关。
 static NSString *threeFingerDisabledKey() {
-    return @"uiscroller_threefinger_disabled";
+    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
+    return [NSString stringWithFormat:@"uiscroller_threefinger_disabled_%@", bid];
 }
 
 // 判断 scroll view 是否在 WKWebView/UIWebView 内部（往 WKScrollView 上挂 tap 会让网页输入框点不动）
@@ -469,11 +471,11 @@ static void cpSetCornerEnabled(BOOL enabled) {
     }
 }
 
-// 三指手势开关（全局）：同步写偏好 + 翻转所有已挂窗口识别器的 enabled
+// 三指手势开关（per-app，与角落一致）：同步写 per-app 偏好 + 翻转全局 uscTFEnabled
 // （enabled=NO 才是真禁用，handler 里 early-return 挡不住触摸被 cancel）
 static void cpSetThreeFingerEnabled(BOOL enabled) {
     [[NSUserDefaults standardUserDefaults] setBool:(!enabled) forKey:threeFingerDisabledKey()];
-    uscTFEnabled = enabled; // 手动三指检测改用全局开关（不再依赖已移除的 UIGestureRecognizer）
+    uscTFEnabled = enabled; // 手动三指检测用全局开关（不再依赖已移除的 UIGestureRecognizer）
 }
 
 static void closeControlPanel(void) {
@@ -831,7 +833,7 @@ void openSimpleMenu() {
     [cornerRow addArrangedSubview:cornerLabel];
     [cornerRow addArrangedSubview:cornerSeg];
 
-    // 三指长按菜单（全局开关：防止与 App 自身三指手势冲突，需要时关掉）
+    // 三指长按菜单（per-app 开关：与角落一致按 App 单独控制，防止与 App 自身三指手势冲突，需要时关掉）
     UIStackView *threeFingerRow = [[UIStackView alloc] init];
     threeFingerRow.axis = UILayoutConstraintAxisHorizontal;
     threeFingerRow.alignment = UIStackViewAlignmentCenter;
