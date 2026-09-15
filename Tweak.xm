@@ -55,21 +55,15 @@ static void uscDbg(NSString *fmt, ...) {
     else { [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
 }
 
-// ── 三指长按：手动统计按下手指数 + 计时，绕开 UIGestureRecognizer ──
+// ── 三指长按：在 sendEvent: 里统计手指数 + 计时，绕开 UIGestureRecognizer ──
 // UIScrollView 滚动时会向 window 发 touchesCancelled，会让 window 级长按识别器失败
 // （故「设置/备忘录/提醒事项/健康/TestFlight 等可滚动 App 三指弹不出菜单」）。
-// 改为直接在 window 的 touch 事件里手动统计，完全不受取消影响，健壮性远高于手势方案。
+// 改为在 window 的 sendEvent: 里手动统计 allTouches 总数，完全不受取消影响，健壮性远高于手势方案。
+// 注意必须 hook sendEvent: 而非 touchesBegan: —— 见下方 sendEvent: 重写的说明。
 static BOOL uscTFEnabled   = YES;   // 由全局开关控制（threeFingerDisabledKey）
+static BOOL uscTFSawThree  = NO;    // 本轮是否见过三指（抗滚动取消干扰，用 allTouches 总数判定）
+static BOOL uscTFStillDown = NO;    // 是否还有手指按着（全部抬起才复位）
 static BOOL uscTFArmed     = NO;    // 已派发 0.5s 计时器
-static int  uscTFLastCount = 0;     // 最近一次记录到的按下手指数
-static int  uscTFActiveTouches(UIEvent *event) {
-    int n = 0;
-    for (UITouch *t in [event allTouches]) {
-        UITouchPhase p = t.phase;
-        if (p == UITouchPhaseBegan || p == UITouchPhaseMoved || p == UITouchPhaseStationary) n++;
-    }
-    return n;
-}
 
 // per-instance 状态存在 associated object 上，避免全局单例导致的：
 //   1) NSTimer 强引用 UIScrollView 造成的对象泄漏
@@ -101,7 +95,6 @@ static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 // ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
 static const void *kAutoActiveKey       = &kAutoActiveKey;
 static const void *kCornerGestureKey    = &kCornerGestureKey;
-static const void *kThreeFingerGestureKey = &kThreeFingerGestureKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
 static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
 static const void *kAutoLastYKey        = &kAutoLastYKey;
@@ -978,8 +971,11 @@ void openSimpleMenu() {
     // begin，系统据此把我们的三指长按判定为失败 -> "部分 App 三指弹不出菜单"。仅对我们的三指手势放宽，
     // 且 cancelsTouchesInView 仍为 NO（不取消 App 触摸），避免误伤 App 自己的三指手势（Risk 1 不回潮）。
     - (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
-        UIGestureRecognizer *tf = objc_getAssociatedObject(self, kThreeFingerGestureKey);
-        if (a == tf || b == tf) return YES;
+        // 让我们自己的角落长按可以与 App 自身的 pan/scroll 等手势并存：否则某些 App（典型如设置）
+        // 的滚动手势会在按下瞬间先 begin，系统据此把我们的角落长按判定为失败 -> "设置里角落长按没反应"。
+        // （之前这里指向已移除的三指手势 key，恒返回 NO，反而把角落手势也拖垮了。）
+        UIGestureRecognizer *corner = objc_getAssociatedObject(self, kCornerGestureKey);
+        if (a == corner || b == corner) return YES;
         return NO;
     }
 
@@ -987,9 +983,13 @@ void openSimpleMenu() {
         %orig;
         if (objc_getAssociatedObject(self, kMenuAddedKey)) return; // 去重：每个 window 只加一次
         // 只给主窗口（normal level）加菜单手势，避开键盘/弹窗等高 level 窗口
-        if (self.windowLevel != UIWindowLevelNormal) return;
+        if (self.windowLevel != UIWindowLevelNormal) {
+            uscDbg(@"becomeKey skip (non-normal): class=%@ level=%g", NSStringFromClass([self class]), self.windowLevel);
+            return;
+        }
+        uscDbg(@"becomeKey add corner: class=%@ level=%g", NSStringFromClass([self class]), self.windowLevel);
         // 三指长按不再用 UIGestureRecognizer（滚动取消会让 window 级长按失败）；改在 window 的
-        // touch 事件里手动统计手指数（见 %hook UIWindow 的 touches* 重写 + uscTrackThreeFinger:）。
+        // sendEvent: 里手动统计 allTouches 手指数（见 sendEvent: 重写 + uscTrackThreeFinger:）。
         // 这里只同步一次全局开关初值。
         uscTFEnabled = ![[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()];
         // 左下角长按：单指按住 0.6s，比三指长按好按且几乎不会误触（见 handleCornerLongPress 内守卫）。
@@ -1040,43 +1040,49 @@ void openSimpleMenu() {
     %new
     - (void)uscTrackThreeFinger:(UIEvent *)event {
         if (!uscTFEnabled) return;
-        if (menuBusy) return; // 菜单已开，避免重复触发
-        int n = uscTFActiveTouches(event);
-        uscTFLastCount = n;
-        if (n >= 3) {
-            if (!uscTFArmed) {
-                uscTFArmed = YES;
-                uscDbg(@"3finger armed, count=%d", n);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                              dispatch_get_main_queue(), ^{
-                    uscTFArmed = NO;
-                    uscDbg(@"3finger timer fired, lastCount=%d enabled=%d busy=%d", uscTFLastCount, uscTFEnabled, menuBusy);
-                    if (uscTFEnabled && !menuBusy && uscTFLastCount >= 3) {
-                        uscDbg(@"3finger -> openSimpleMenu");
-                        openSimpleMenu();
-                    }
-                });
-            }
-        } else {
-            uscTFArmed = NO;
+        if (menuBusy) return;                 // 菜单已开，避免重复触发
+        if (event.type != UIEventTypeTouches) return;
+        NSSet<UITouch *> *all = [event allTouches];
+        NSInteger total = (NSInteger)all.count;
+        if (total == 0) return;
+        NSInteger down = 0;
+        for (UITouch *t in all) {
+            UITouchPhase p = t.phase;
+            if (p == UITouchPhaseBegan || p == UITouchPhaseMoved || p == UITouchPhaseStationary) down++;
+        }
+        if (down == 0) {
+            // 全部抬起/取消：本轮结束，复位（避免残留状态导致单击误触发）
+            uscTFSawThree = NO; uscTFStillDown = NO; uscTFArmed = NO;
+            return;
+        }
+        uscTFStillDown = YES;
+        // 用 allTouches 总数判定三指，而非"active 相位"计数：滚动取消个别手指时相位会变 Cancelled，
+        // 但触摸仍留在事件集合里，总数不会掉到 0，从而抗滚动取消干扰。
+        if (total >= 3) uscTFSawThree = YES;
+        if (uscTFSawThree && !uscTFArmed) {
+            uscTFArmed = YES;
+            uscDbg(@"3finger armed, total=%ld down=%ld", (long)total, (long)down);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                          dispatch_get_main_queue(), ^{
+                uscTFArmed = NO;
+                uscDbg(@"3finger timer fired, sawThree=%d stillDown=%d enabled=%d busy=%d",
+                       uscTFSawThree, uscTFStillDown, uscTFEnabled, menuBusy);
+                if (uscTFEnabled && !menuBusy && uscTFSawThree && uscTFStillDown) {
+                    uscTFSawThree = NO;       // 消费，防本轮重复开
+                    uscDbg(@"3finger -> openSimpleMenu");
+                    openSimpleMenu();
+                }
+            });
         }
     }
 
-    - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    // 关键：三指统计必须在 sendEvent: 里拦截，而不是 touchesBegan/Moved/Ended/Cancelled。
+    // 原因：很多 App（尤其系统 App）的自定义 UIWindow 子类重写了 touchesBegan: 却没调 super，
+    // 导致 %hook UIWindow 的 touches* 重写根本不会被调到 —— 三指永远不触发。而 sendEvent: 是
+    // UIApplication 向窗口投送事件的唯一入口，子类几乎都会调 super，hook 它万无一失。
+    - (void)sendEvent:(UIEvent *)event {
         %orig;
-        [self uscTrackThreeFinger:event];
-    }
-    - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-        %orig;
-        [self uscTrackThreeFinger:event];
-    }
-    - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-        %orig;
-        [self uscTrackThreeFinger:event];
-    }
-    - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
-        %orig;
-        [self uscTrackThreeFinger:event];
+        if (self.windowLevel == UIWindowLevelNormal) [self uscTrackThreeFinger:event];
     }
 
 %end
