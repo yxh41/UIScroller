@@ -23,7 +23,6 @@
 @end
 
 @interface UIWindow (UIScroller)
-- (void)handleMenuLongPress:(UILongPressGestureRecognizer *)gesture;
 - (void)uscTrackThreeFinger:(UIEvent *)event;
 - (void)uscTrackCorner:(UIEvent *)event;
 @end
@@ -45,7 +44,6 @@
 // （故「设置/备忘录/提醒事项/健康/TestFlight 等可滚动 App 三指弹不出菜单」）。
 // 改为在 window 的 sendEvent: 里手动统计 allTouches 总数，完全不受取消影响，健壮性远高于手势方案。
 // 注意必须 hook sendEvent: 而非 touchesBegan: —— 见下方 sendEvent: 重写的说明。
-static BOOL uscTFEnabled   = YES;   // 由全局开关控制（threeFingerDisabledKey）
 static BOOL uscTFSawThree  = NO;    // 本轮是否见过三指（抗滚动取消干扰，用 allTouches 总数判定）
 static BOOL uscTFStillDown = NO;    // 是否还有手指按着（全部抬起才复位）
 static BOOL uscTFArmed     = NO;    // 已派发 0.5s 计时器
@@ -61,7 +59,6 @@ static BOOL uscCornerValid  = NO;      // 截至最近一次事件，该 touch �
 static const void *kScrollTimerKey      = &kScrollTimerKey;
 static const void *kAutoDisableTimerKey = &kAutoDisableTimerKey;
 static const void *kStopGestureKey       = &kStopGestureKey;
-static const void *kMenuAddedKey        = &kMenuAddedKey;
 static const void *kVerticalDownKey     = &kVerticalDownKey;
 static const void *kDragVelocityKey     = &kDragVelocityKey;
 static const void *kScrollStartKey      = &kScrollStartKey;
@@ -83,7 +80,6 @@ static const void *kEdgeWaitKey         = &kEdgeWaitKey;
 static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 // ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
 static const void *kAutoActiveKey       = &kAutoActiveKey;
-static const void *kCornerGestureKey    = &kCornerGestureKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
 static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
 static const void *kAutoLastYKey        = &kAutoLastYKey;
@@ -449,20 +445,14 @@ static void cpRefreshSummary(void) {
     if (cpSummaryLabel) cpSummaryLabel.text = cpSummaryText();
 }
 
-// 角落手势开关：写 per-app 偏好（uscTrackCorner: 直接读 cornerDisabledKey 决定是否触发）
+// 角落手势开关：写 per-app 偏好（uscTrackCorner: 直接读 cornerDisabledKey 决定是否触发，不挂手势故无需改手势 enabled）
 static void cpSetCornerEnabled(BOOL enabled) {
     [[NSUserDefaults standardUserDefaults] setBool:(!enabled) forKey:cornerDisabledKey()];
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        UILongPressGestureRecognizer *g = objc_getAssociatedObject(w, kCornerGestureKey);
-        if (g) g.enabled = enabled;
-    }
 }
 
-// 三指手势开关（per-app，与角落一致）：同步写 per-app 偏好 + 翻转全局 uscTFEnabled
-// （enabled=NO 才是真禁用，handler 里 early-return 挡不住触摸被 cancel）
+// 三指手势开关（per-app，与角落一致）：写 per-app 偏好；uscTrackThreeFinger: 每次现读此 key，无需全局缓存
 static void cpSetThreeFingerEnabled(BOOL enabled) {
     [[NSUserDefaults standardUserDefaults] setBool:(!enabled) forKey:threeFingerDisabledKey()];
-    uscTFEnabled = enabled; // 手动三指检测用全局开关（不再依赖已移除的 UIGestureRecognizer）
 }
 
 static void closeControlPanel(void) {
@@ -934,29 +924,6 @@ void openSimpleMenu() {
 
 %hook UIWindow
 
-    - (void)becomeKeyWindow {
-        %orig;
-        if (objc_getAssociatedObject(self, kMenuAddedKey)) return; // 去重：每个 window 只加一次
-        // 只给主窗口（normal level）加菜单手势，避开键盘/弹窗等高 level 窗口
-        if (self.windowLevel != UIWindowLevelNormal) {
-            return;
-        }
-        // 三指/角落长按统一在 sendEvent: 里手动检测（见 uscTrackThreeFinger: / uscTrackCorner:），
-        // 不再挂 UIGestureRecognizer：App 自身的 pan/scroll/context-menu 长按会在按下瞬间 begin 或 cancel
-        // 我们的触摸，导致 window 级长按识别失败（设置里尤其明显，角落完全不触发）。
-        // 这里只同步三指 per-app 开关初值（角落开关在 uscTrackCorner: 里直接读 cornerDisabledKey）。
-        uscTFEnabled = ![[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()];
-        objc_setAssociatedObject(self, kMenuAddedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-
-    %new
-    - (void)handleMenuLongPress:(UILongPressGestureRecognizer *)gesture {
-        // 长按手势在 Began/Changed/Ended 每个状态变化都会回调一次。
-        // 不判断状态的话，点菜单按钮让 alert 消失的瞬间会被再次触发 -> 菜单反复弹出并卡住。
-        if (gesture.state != UIGestureRecognizerStateBegan) return;
-        openSimpleMenu();
-    }
-
     // ── 角落长按：与三指同理，从 sendEvent: 手动检测（绕开 UIGestureRecognizer 被 App 手势 cancel）──
     // 原 UILongPressGestureRecognizer 方案在设置等 App 必现不触发：App 自身的 pan/scroll/context-menu
     // 长按会在按下瞬间 begin 或 cancel 我们的触摸，导致 window 级长按识别失败（gestureRecognizerShouldBegin:
@@ -1008,9 +975,13 @@ void openSimpleMenu() {
     // ── 三指长按：手动统计按下的手指数 + 0.5s 计时（绕开 UIGestureRecognizer 的滚动取消）──
     %new
     - (void)uscTrackThreeFinger:(UIEvent *)event {
-        if (!uscTFEnabled) return;
         if (menuBusy) return;                 // 菜单已开，避免重复触发
         if (event.type != UIEventTypeTouches) return;
+        // 与角落一致：每次按 App 现读 per-app 开关，避免跨 App 切换后全局状态滞后
+        // （原 uscTFEnabled 仅在 becomeKeyWindow 同步一次，dedup 后切回原 App 不重新同步，开关状态会错乱）
+        if ([[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()]) {
+            uscTFSawThree = NO; uscTFStillDown = NO; uscTFArmed = NO; return;
+        }
         NSSet<UITouch *> *all = [event allTouches];
         NSInteger total = (NSInteger)all.count;
         if (total == 0) return;
@@ -1033,7 +1004,7 @@ void openSimpleMenu() {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                           dispatch_get_main_queue(), ^{
                 uscTFArmed = NO;
-                if (uscTFEnabled && !menuBusy && uscTFSawThree && uscTFStillDown) {
+                if (!menuBusy && uscTFSawThree && uscTFStillDown) {
                     uscTFSawThree = NO;       // 消费，防本轮重复开
                     // 震动反馈：与角落一致，长按没反馈容易不知道有没有用上劲
                     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
