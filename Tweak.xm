@@ -676,6 +676,23 @@ void openSimpleMenu() {
     // 先捕获原 key window：此刻覆盖窗口仍是 hidden，绝不可能是 key —— 避免把"上一个 key window"
     // 记成覆盖窗口自己（那样关闭时会还原给它，App 窗口永远拿不回 key）。
     uscPrevKeyWindow = uscCurrentKeyWindow();
+    // 关键修复：覆盖窗口必须挂到当前 key window 所在的 UIWindowScene，否则在 scene 严格化的 App
+    // （本类 IC*/分栏系统 App 等）里窗口不会真正上屏、也成不了 key —— 表现为"手势有震动、
+    // openSimpleMenu 走到 shown，但菜单看不见 / 三指无反应"。iOS 13+ 无 scene 的 UIWindow 不会被合成显示。
+    // 覆盖窗口在 tweak 加载时（dispatch_once，早于任何 scene 激活）创建，本身没有 windowScene，
+    // 所以必须在每次展示前临时挂到活跃 scene 上。
+    id activeScene = uscPrevKeyWindow.windowScene;
+    if (!activeScene) {
+        // 兜底：key window 暂时没有 scene（过渡期等），从 connectedScenes 取一个前台激活的 UIWindowScene
+        for (id s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:NSClassFromString(@"UIWindowScene")] &&
+                ((NSInteger)[s activationState] == 1)) { // UISceneActivationStateForegroundActive == 1
+                activeScene = s;
+                break;
+            }
+        }
+    }
+    if (activeScene) uscOverlayWindow().windowScene = activeScene;
     UIView *container = uscOverlayWindow().rootViewController.view;
     uscOverlayWindow().hidden = NO;
     // 让覆盖窗口成为 key window：非 key 的高 level 窗口在连续手势（拖拽面板）的触摸投递上
@@ -683,7 +700,7 @@ void openSimpleMenu() {
     // 记住原 key window，关闭时还原，不抢 App 的 firstResponder / 键盘。
     [uscOverlayWindow() makeKeyWindow];
     menuBusy = YES;
-    uscDbg(@"openSimpleMenu shown, overlay hidden=%d keyWin=%d", uscOverlayWindow().hidden, uscOverlayWindow().isKeyWindow);
+    uscDbg(@"openSimpleMenu shown, overlay hidden=%d keyWin=%d scene=%p", uscOverlayWindow().hidden, uscOverlayWindow().isKeyWindow, uscOverlayWindow().windowScene);
 
     // 背景：轻遮罩，点击即关
     controlBackdrop = [[UIView alloc] initWithFrame:container.bounds];
