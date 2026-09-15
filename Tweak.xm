@@ -2,7 +2,6 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <math.h>
-#include <stdarg.h>
 
 @interface UIScrollView (UIScroller)
 @property (nonatomic,readonly) UIPanGestureRecognizer *panGestureRecognizer;
@@ -40,20 +39,6 @@
     [self.scrollView autoScroll];
 }
 @end
-
-// ── 调试日志（真机排查用，稳定后移除）──
-// 写入 /var/mobile/Documents/uiscroller_debug.log，用 Filza 等查看。
-static void uscDbg(NSString *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSString *path = @"/var/mobile/Documents/uiscroller_debug.log";
-    NSString *line = [NSString stringWithFormat:@"[%.3f] %@\n",
-        [[NSDate date] timeIntervalSince1970], msg];
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (fh) { [fh seekToEndOfFile]; [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]]; [fh closeFile]; }
-    else { [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil]; }
-}
 
 // ── 三指长按：在 sendEvent: 里统计手指数 + 计时，绕开 UIGestureRecognizer ──
 // UIScrollView 滚动时会向 window 发 touchesCancelled，会让 window 级长按识别器失败
@@ -304,7 +289,6 @@ id topViewController() {
             if (picked && picked != topController) { topController = picked; descended = YES; }
         }
     }
-    uscDbg(@"topViewController keyWin=%@ root=%@ result=%@", NSStringFromClass([keyWindow class]), NSStringFromClass([rootController class]), NSStringFromClass([topController class]));
     return topController;
 }
 
@@ -658,16 +642,14 @@ static USControlPanelProxy *cpTargetProxy(void) {
 }
 
 void openSimpleMenu() {
-    uscDbg(@"openSimpleMenu enter menuBusy=%d backdrop=%p", menuBusy, controlBackdrop);
-    if (menuBusy || controlBackdrop) { uscDbg(@"openSimpleMenu abort: already busy/showing"); return; }
+    if (menuBusy || controlBackdrop) { return; }
     UIViewController *presenter = topViewController();
-    uscDbg(@"openSimpleMenu presenter=%@ presented=%@", NSStringFromClass([presenter class]), NSStringFromClass([presenter.presentedViewController class]));
-    if (!presenter) { uscDbg(@"openSimpleMenu abort: no presenter"); return; }
-    if ([presenter isKindOfClass:[UIAlertController class]]) { uscDbg(@"openSimpleMenu abort: presenter is alert"); return; }
+    if (!presenter) { return; }
+    if ([presenter isKindOfClass:[UIAlertController class]]) { return; }
     // 只在最上层 presented 是系统弹窗（alert）时才放弃打开：菜单挂在独立顶层覆盖窗口上，
     // 叠在分享面板/常驻容器 VC 之上是安全的。之前一刀切拦截 presentedViewController，
     // 导致某些 App（navigation 内 visibleVC 长期 present 着东西）永远触发不了菜单。
-    if ([presenter.presentedViewController isKindOfClass:[UIAlertController class]]) { uscDbg(@"openSimpleMenu abort: presenter.presented is alert"); return; }
+    if ([presenter.presentedViewController isKindOfClass:[UIAlertController class]]) { return; }
 
     // 用专用高 level 覆盖窗口承载面板（见 uscOverlayWindow），避免被 App 自身的透明 overlay
     // 窗口挡在前面导致面板"看得见却点不动"（Telegram 等 App 的典型表现）。
@@ -698,7 +680,6 @@ void openSimpleMenu() {
     // 记住原 key window，关闭时还原，不抢 App 的 firstResponder / 键盘。
     [uscOverlayWindow() makeKeyWindow];
     menuBusy = YES;
-    uscDbg(@"openSimpleMenu shown, overlay hidden=%d keyWin=%d scene=%p", uscOverlayWindow().hidden, uscOverlayWindow().isKeyWindow, uscOverlayWindow().windowScene);
 
     // 背景：轻遮罩，点击即关
     controlBackdrop = [[UIView alloc] initWithFrame:container.bounds];
@@ -958,10 +939,8 @@ void openSimpleMenu() {
         if (objc_getAssociatedObject(self, kMenuAddedKey)) return; // 去重：每个 window 只加一次
         // 只给主窗口（normal level）加菜单手势，避开键盘/弹窗等高 level 窗口
         if (self.windowLevel != UIWindowLevelNormal) {
-            uscDbg(@"becomeKey skip (non-normal): class=%@ level=%g", NSStringFromClass([self class]), self.windowLevel);
             return;
         }
-        uscDbg(@"becomeKey init: class=%@ level=%g", NSStringFromClass([self class]), self.windowLevel);
         // 三指/角落长按统一在 sendEvent: 里手动检测（见 uscTrackThreeFinger: / uscTrackCorner:），
         // 不再挂 UIGestureRecognizer：App 自身的 pan/scroll/context-menu 长按会在按下瞬间 begin 或 cancel
         // 我们的触摸，导致 window 级长按识别失败（设置里尤其明显，角落完全不触发）。
@@ -1006,7 +985,6 @@ void openSimpleMenu() {
                 uscCornerTouch = candidate;
                 if (!uscCornerArmed) {
                     uscCornerArmed = YES;
-                    uscDbg(@"corner manual armed");
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kMenuCornerHold * NSEC_PER_SEC)),
                                   dispatch_get_main_queue(), ^{
                         uscCornerArmed = NO;
@@ -1016,7 +994,6 @@ void openSimpleMenu() {
                             // 震动反馈（与三指一致）+ 弹菜单（内部 menuBusy 防重入）
                             UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
                             [haptic impactOccurred];
-                            uscDbg(@"corner manual fired (haptic) -> openSimpleMenu");
                             openSimpleMenu();
                         }
                     });
@@ -1053,18 +1030,14 @@ void openSimpleMenu() {
         if (total >= 3) uscTFSawThree = YES;
         if (uscTFSawThree && !uscTFArmed) {
             uscTFArmed = YES;
-            uscDbg(@"3finger armed, total=%ld down=%ld", (long)total, (long)down);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                           dispatch_get_main_queue(), ^{
                 uscTFArmed = NO;
-                uscDbg(@"3finger timer fired, sawThree=%d stillDown=%d enabled=%d busy=%d",
-                       uscTFSawThree, uscTFStillDown, uscTFEnabled, menuBusy);
                 if (uscTFEnabled && !menuBusy && uscTFSawThree && uscTFStillDown) {
                     uscTFSawThree = NO;       // 消费，防本轮重复开
                     // 震动反馈：与角落一致，长按没反馈容易不知道有没有用上劲
                     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
                     [haptic impactOccurred];
-                    uscDbg(@"3finger -> openSimpleMenu (haptic)");
                     openSimpleMenu();
                 }
             });
