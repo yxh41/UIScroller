@@ -25,8 +25,8 @@
 
 @interface UIWindow (UIScroller)
 - (void)handleMenuLongPress:(UILongPressGestureRecognizer *)gesture;
-- (void)handleCornerLongPress:(UILongPressGestureRecognizer *)gesture;
 - (void)uscTrackThreeFinger:(UIEvent *)event;
+- (void)uscTrackCorner:(UIEvent *)event;
 @end
 
 // CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
@@ -64,6 +64,10 @@ static BOOL uscTFEnabled   = YES;   // 由全局开关控制（threeFingerDisabl
 static BOOL uscTFSawThree  = NO;    // 本轮是否见过三指（抗滚动取消干扰，用 allTouches 总数判定）
 static BOOL uscTFStillDown = NO;    // 是否还有手指按着（全部抬起才复位）
 static BOOL uscTFArmed     = NO;    // 已派发 0.5s 计时器
+// 角落长按压手动检测状态（与三指同理，改从 sendEvent: 拦截，避免被 App 手势 cancel 导致不触发）
+static UITouch *uscCornerTouch = nil;  // 当前在角落扇形内跟踪的单指 touch（按指针 identity 区分）
+static BOOL uscCornerArmed  = NO;      // 已派发 kMenuCornerHold 计时器
+static BOOL uscCornerValid  = NO;      // 截至最近一次事件，该 touch 仍在扇形内且为唯一手指
 
 // per-instance 状态存在 associated object 上，避免全局单例导致的：
 //   1) NSTimer 强引用 UIScrollView 造成的对象泄漏
@@ -461,8 +465,7 @@ static void cpRefreshSummary(void) {
     if (cpSummaryLabel) cpSummaryLabel.text = cpSummaryText();
 }
 
-// 角落手势开关：同步写 per-app 偏好 + 翻转所有已挂窗口识别器的 enabled
-// （enabled=NO 才是真禁用，handler 里 early-return 挡不住触摸被 cancel）
+// 角落手势开关：写 per-app 偏好（uscTrackCorner: 直接读 cornerDisabledKey 决定是否触发）
 static void cpSetCornerEnabled(BOOL enabled) {
     [[NSUserDefaults standardUserDefaults] setBool:(!enabled) forKey:cornerDisabledKey()];
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
@@ -948,38 +951,7 @@ void openSimpleMenu() {
     }];
 }
 
-@interface UIWindow (UIScrollerCornerDelegate) <UIGestureRecognizerDelegate>
-@end
-
 %hook UIWindow
-
-    - (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
-        // 只拦截我们自己的角落长按：落点不在角落扇形内（或已禁用）时立刻返回 NO，
-        // 识别器直接失败，不会 cancel 系统长按（微信/TG 消息菜单、文字选择等）——
-        // 这正是「长按消息不出菜单 / TG 快捷菜单卡住」的根因：之前只在 handler 里 early-return，
-        // 但识别器已经 begin 并 cancel 了触摸，系统长按被掐掉。
-        if (gestureRecognizer == objc_getAssociatedObject(self, kCornerGestureKey)) {
-            if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) { uscDbg(@"corner shouldBegin=NO (disabled)"); return NO; }
-            CGPoint p = [gestureRecognizer locationInView:self];
-            CGFloat dx = (cornerGestureSide == 1) ? (CGRectGetWidth(self.bounds) - p.x) : p.x;
-            CGFloat dy = p.y - CGRectGetHeight(self.bounds);
-            if (sqrt(dx * dx + dy * dy) > (CGFloat)kMenuCornerRadius) { uscDbg(@"corner shouldBegin=NO (outside fan)"); return NO; }
-            uscDbg(@"corner shouldBegin=YES");
-        }
-        return YES;
-    }
-
-    // 让三指菜单长按能和 App 自身的 pan/scroll 等手势并存：否则某些 App 的 pan 会在按下瞬间先
-    // begin，系统据此把我们的三指长按判定为失败 -> "部分 App 三指弹不出菜单"。仅对我们的三指手势放宽，
-    // 且 cancelsTouchesInView 仍为 NO（不取消 App 触摸），避免误伤 App 自己的三指手势（Risk 1 不回潮）。
-    - (BOOL)gestureRecognizer:(UIGestureRecognizer *)a shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)b {
-        // 让我们自己的角落长按可以与 App 自身的 pan/scroll 等手势并存：否则某些 App（典型如设置）
-        // 的滚动手势会在按下瞬间先 begin，系统据此把我们的角落长按判定为失败 -> "设置里角落长按没反应"。
-        // （之前这里指向已移除的三指手势 key，恒返回 NO，反而把角落手势也拖垮了。）
-        UIGestureRecognizer *corner = objc_getAssociatedObject(self, kCornerGestureKey);
-        if (a == corner || b == corner) return YES;
-        return NO;
-    }
 
     - (void)becomeKeyWindow {
         %orig;
@@ -989,25 +961,12 @@ void openSimpleMenu() {
             uscDbg(@"becomeKey skip (non-normal): class=%@ level=%g", NSStringFromClass([self class]), self.windowLevel);
             return;
         }
-        uscDbg(@"becomeKey add corner: class=%@ level=%g", NSStringFromClass([self class]), self.windowLevel);
-        // 三指长按不再用 UIGestureRecognizer（滚动取消会让 window 级长按失败）；改在 window 的
-        // sendEvent: 里手动统计 allTouches 手指数（见 sendEvent: 重写 + uscTrackThreeFinger:）。
-        // 这里只同步一次全局开关初值。
+        uscDbg(@"becomeKey init: class=%@ level=%g", NSStringFromClass([self class]), self.windowLevel);
+        // 三指/角落长按统一在 sendEvent: 里手动检测（见 uscTrackThreeFinger: / uscTrackCorner:），
+        // 不再挂 UIGestureRecognizer：App 自身的 pan/scroll/context-menu 长按会在按下瞬间 begin 或 cancel
+        // 我们的触摸，导致 window 级长按识别失败（设置里尤其明显，角落完全不触发）。
+        // 这里只同步三指 per-app 开关初值（角落开关在 uscTrackCorner: 里直接读 cornerDisabledKey）。
         uscTFEnabled = ![[NSUserDefaults standardUserDefaults] boolForKey:threeFingerDisabledKey()];
-        // 左下角长按：单指按住 0.6s，比三指长按好按且几乎不会误触（见 handleCornerLongPress 内守卫）。
-        // enabled 必须跟 per-app 开关同步：识别器只要 enabled 且识别成功就会 cancel 触摸，
-        // 仅在 handler 里 early-return 挡不住"App 底部长按被摸死"的问题。
-        UILongPressGestureRecognizer *cornerGesture = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleCornerLongPress:)];
-        cornerGesture.numberOfTouchesRequired = 1;
-        cornerGesture.minimumPressDuration = kMenuCornerHold;
-        cornerGesture.enabled = ![[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()];
-        // 关键：把识别器委托给 window 自己，让 gestureRecognizerShouldBegin: 在「开始识别」前先裁决。
-        // 落点不在角落扇形内（或已禁用）时返回 NO，识别器直接失败、不会 cancel 系统长按
-        // —— 这正是「微信消息长按不出菜单 / TG 快捷菜单卡住」的根因：之前只在 handler 里 early-return，
-        // 但识别器已经 begin 并 cancel 了触摸，系统长按被掐掉。
-        cornerGesture.delegate = self;
-        [self addGestureRecognizer:cornerGesture];
-        objc_setAssociatedObject(self, kCornerGestureKey, cornerGesture, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kMenuAddedKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
@@ -1019,23 +978,54 @@ void openSimpleMenu() {
         openSimpleMenu();
     }
 
+    // ── 角落长按：与三指同理，从 sendEvent: 手动检测（绕开 UIGestureRecognizer 被 App 手势 cancel）──
+    // 原 UILongPressGestureRecognizer 方案在设置等 App 必现不触发：App 自身的 pan/scroll/context-menu
+    // 长按会在按下瞬间 begin 或 cancel 我们的触摸，导致 window 级长按识别失败（gestureRecognizerShouldBegin:
+    // 根本不会被调用）。改在 sendEvent: 直接读 touch 位置判定，彻底绕开手势竞争。
     %new
-    - (void)handleCornerLongPress:(UILongPressGestureRecognizer *)gesture {
-        if (gesture.state != UIGestureRecognizerStateBegan) return;
-        uscDbg(@"corner gesture began (fan/passed) state=%ld", (long)gesture.state);
-        // per-app 禁用：部分 App 底部角落有自己的长按功能（拖拽排序/清除角标等），
-        // 在菜单里关掉角落手势即可 —— 触发频率低，每次读一次 NSUserDefaults 开销可忽略。
-        if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) return;
-        // 1) 落点必须在角落扇形内（圆心 = 屏幕下角点，半径 kMenuCornerRadius；左右可切）
-        CGPoint p = [gesture locationInView:self];
-        CGFloat dx = (cornerGestureSide == 1) ? (CGRectGetWidth(self.bounds) - p.x) : p.x;
-        CGFloat dy = p.y - CGRectGetHeight(self.bounds);
-        if (sqrt(dx * dx + dy * dy) > (CGFloat)kMenuCornerRadius) return;
-        // 2) 震动反馈（长按没反馈容易不知道有没有用上劲）+ 弹菜单（内部有 menuBusy 防重入）
-        UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-        [haptic impactOccurred];
-        uscDbg(@"corner fired (haptic) -> openSimpleMenu");
-        openSimpleMenu();
+    - (void)uscTrackCorner:(UIEvent *)event {
+        if (event.type != UIEventTypeTouches) return;
+        if ([[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()] || menuBusy) {
+            uscCornerTouch = nil; uscCornerArmed = NO; uscCornerValid = NO; return;
+        }
+        NSSet<UITouch *> *all = [event allTouches];
+        UITouch *candidate = nil;
+        NSInteger downCount = 0;
+        for (UITouch *t in all) {
+            UITouchPhase p = t.phase;
+            if (p == UITouchPhaseBegan || p == UITouchPhaseMoved || p == UITouchPhaseStationary) {
+                downCount++;
+                CGPoint loc = [t locationInView:self];
+                CGFloat dx = (cornerGestureSide == 1) ? (CGRectGetWidth(self.bounds) - loc.x) : loc.x;
+                CGFloat dy = loc.y - CGRectGetHeight(self.bounds);
+                if (sqrt(dx * dx + dy * dy) <= (CGFloat)kMenuCornerRadius) candidate = t;
+            }
+        }
+        if (candidate && downCount == 1) {
+            if (uscCornerTouch != candidate) {
+                uscCornerTouch = candidate;
+                if (!uscCornerArmed) {
+                    uscCornerArmed = YES;
+                    uscDbg(@"corner manual armed");
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kMenuCornerHold * NSEC_PER_SEC)),
+                                  dispatch_get_main_queue(), ^{
+                        uscCornerArmed = NO;
+                        if (uscCornerValid && uscCornerTouch && !menuBusy &&
+                            ![[NSUserDefaults standardUserDefaults] boolForKey:cornerDisabledKey()]) {
+                            uscCornerValid = NO;       // 消费，防本轮重复开
+                            // 震动反馈（与三指一致）+ 弹菜单（内部 menuBusy 防重入）
+                            UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+                            [haptic impactOccurred];
+                            uscDbg(@"corner manual fired (haptic) -> openSimpleMenu");
+                            openSimpleMenu();
+                        }
+                    });
+                }
+            }
+            uscCornerValid = YES;
+        } else {
+            uscCornerTouch = nil; uscCornerArmed = NO; uscCornerValid = NO;
+        }
     }
 
     // ── 三指长按：手动统计按下的手指数 + 0.5s 计时（绕开 UIGestureRecognizer 的滚动取消）──
@@ -1087,7 +1077,10 @@ void openSimpleMenu() {
     // UIApplication 向窗口投送事件的唯一入口，子类几乎都会调 super，hook 它万无一失。
     - (void)sendEvent:(UIEvent *)event {
         %orig;
-        if (self.windowLevel == UIWindowLevelNormal) [self uscTrackThreeFinger:event];
+        if (self.windowLevel == UIWindowLevelNormal) {
+            [self uscTrackThreeFinger:event];
+            [self uscTrackCorner:event];
+        }
     }
 
 %end
