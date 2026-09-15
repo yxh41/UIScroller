@@ -1071,7 +1071,10 @@ void openSimpleMenu() {
                        uscTFSawThree, uscTFStillDown, uscTFEnabled, menuBusy);
                 if (uscTFEnabled && !menuBusy && uscTFSawThree && uscTFStillDown) {
                     uscTFSawThree = NO;       // 消费，防本轮重复开
-                    uscDbg(@"3finger -> openSimpleMenu");
+                    // 震动反馈：与角落一致，长按没反馈容易不知道有没有用上劲
+                    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+                    [haptic impactOccurred];
+                    uscDbg(@"3finger -> openSimpleMenu (haptic)");
                     openSimpleMenu();
                 }
             });
