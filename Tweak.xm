@@ -26,6 +26,7 @@
 @interface UIWindow (UIScroller)
 - (void)handleMenuLongPress:(UILongPressGestureRecognizer *)gesture;
 - (void)handleCornerLongPress:(UILongPressGestureRecognizer *)gesture;
+- (void)uscTrackThreeFinger:(UIEvent *)event;
 @end
 
 // CADisplayLink 的 target 会被 link 强引用；用一个只弱引用 self 的 proxy 打破循环，
@@ -1019,6 +1020,7 @@ void openSimpleMenu() {
     }
 
     // ── 三指长按：手动统计按下的手指数 + 0.5s 计时（绕开 UIGestureRecognizer 的滚动取消）──
+    %new
     - (void)uscTrackThreeFinger:(UIEvent *)event {
         if (!uscTFEnabled) return;
         if (menuBusy) return; // 菜单已开，避免重复触发
