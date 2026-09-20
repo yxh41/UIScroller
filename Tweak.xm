@@ -48,7 +48,10 @@ static BOOL uscTFSawThree  = NO;    // 本轮是否见过三指（抗滚动取�
 static BOOL uscTFStillDown = NO;    // 是否还有手指按着（全部抬起才复位）
 static BOOL uscTFArmed     = NO;    // 已派发 0.5s 计时器
 // 角落长按压手动检测状态（与三指同理，改从 sendEvent: 拦截，避免被 App 手势 cancel 导致不触发）
-static UITouch *uscCornerTouch = nil;  // 当前在角落扇形内跟踪的单指 touch（按指针 identity 区分）
+// __weak 而非 strong：系统 UITouch 在触摸结束后会被回收/复用，strong 静态变量会一直把它 retain 住
+// （跨整个 App 生命周期持有已死的系统对象）。weak 在对象销毁时自动置 nil，语义更诚实。
+// 注意它只用于"是否换了一根手指"的 identity 比较，中途置 nil 不影响判定（下一轮事件会重新赋值）。
+static __weak UITouch *uscCornerTouch = nil;  // 当前在角落扇形内跟踪的单指 touch（按指针 identity 区分）
 static BOOL uscCornerArmed  = NO;      // 已派发 kMenuCornerHold 计时器
 static BOOL uscCornerValid  = NO;      // 截至最近一次事件，该 touch 仍在扇形内且为唯一手指
 
@@ -81,10 +84,8 @@ static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 // ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
 static const void *kAutoActiveKey       = &kAutoActiveKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
-static const void *kAutoStartTimeKey    = &kAutoStartTimeKey;
 static const void *kAutoLastYKey        = &kAutoLastYKey;
 static const void *kAutoLastTKey        = &kAutoLastTKey;
-static const void *kAutoStallKey        = &kAutoStallKey;
 static const void *kOrigFactorKey       = &kOrigFactorKey;
 // 私有 API（_verticalVelocity）维持无效时置 YES：本进程内自动档退回我们自己的驱动
 static BOOL nativeSustainBroken = NO;
@@ -97,6 +98,58 @@ BOOL keepScreenAwake = NO;  // 自动滚动期间禁止息屏（默认关，菜�
 int autoForceMultiplier = 100; // 自动档力道倍率（%）：100=1×，菜单可选 0.5/1/1.5/2
 int cornerGestureSide = 0;  // 角落手势位置：0=左下 1=右下（可按 App 禁用，见 cornerDisabledKey）
 int gearSpeedAdjust = 0;    // 固定挡速度微调（pt/s）：菜单 ±100 细调基准档位
+
+// ── 设置持久化 ──
+// 上面 6 个变量以前是纯进程内全局：只在面板里赋值，App 一退出（或被系统回收）就回默认。
+// 每个 App 都是独立进程，所以"在 A 里调好较快+1.5×+常亮，切到 B 全部回默认"——这是实打实的体验缺口。
+// 现在在 %ctor 里载入、每个 setter 里落盘。
+// 存**全局**而非 per-app：档位/倍率/常亮是用户的使用习惯，不是某个 App 的特性。
+// （"禁用"类开关才需要 per-app，见 disabledKey / cornerDisabledKey / threeFingerDisabledKey。）
+static NSString *const kPrefSpeedKey      = @"uiscroller_pref_speed";       // 0-4
+static NSString *const kPrefForceKey      = @"uiscroller_pref_force";       // 50-200 (%)
+static NSString *const kPrefAutoStopKey   = @"uiscroller_pref_autostop";    // 0-180 (min)
+static NSString *const kPrefKeepAwakeKey  = @"uiscroller_pref_keepawake";   // bool
+static NSString *const kPrefCornerSideKey = @"uiscroller_pref_cornerside";  // 0/1
+static NSString *const kPrefGearAdjKey    = @"uiscroller_pref_gearadjust";  // -100..100 (pt/s)
+
+// 数值范围钳制：用户手改 plist / 旧版本残留 / 越界值都要挡住。
+// 尤其是 scrollSpeedType —— 它同时用作 kGearSpeed[] 数组下标和 UISegmentedControl.selectedSegmentIndex，
+// 越界会直接崩（数组越界或分段控件抛异常）。
+static void uscClampPrefs(void) {
+    if (scrollSpeedType < 0) scrollSpeedType = 0;
+    if (scrollSpeedType > 4) scrollSpeedType = 4;
+    if (autoForceMultiplier < 50) autoForceMultiplier = 50;
+    if (autoForceMultiplier > 200) autoForceMultiplier = 200;
+    if (autoDisableMinutes < 0) autoDisableMinutes = 0;
+    if (autoDisableMinutes > 180) autoDisableMinutes = 180;
+    if (cornerGestureSide != 0) cornerGestureSide = 1;
+    if (gearSpeedAdjust < -100) gearSpeedAdjust = -100;
+    if (gearSpeedAdjust > 100) gearSpeedAdjust = 100;
+}
+
+static void uscLoadPrefs(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    // 用 objectForKey 判"是否存在"，而不是直接读值 —— 否则用户主动设成 0/NO 会被当成未设置而回默认
+    if ([d objectForKey:kPrefSpeedKey])      scrollSpeedType      = (int)[d integerForKey:kPrefSpeedKey];
+    if ([d objectForKey:kPrefForceKey])      autoForceMultiplier  = (int)[d integerForKey:kPrefForceKey];
+    if ([d objectForKey:kPrefAutoStopKey])   autoDisableMinutes   = (int)[d integerForKey:kPrefAutoStopKey];
+    if ([d objectForKey:kPrefKeepAwakeKey])  keepScreenAwake      = [d boolForKey:kPrefKeepAwakeKey];
+    if ([d objectForKey:kPrefCornerSideKey]) cornerGestureSide    = (int)[d integerForKey:kPrefCornerSideKey];
+    if ([d objectForKey:kPrefGearAdjKey])    gearSpeedAdjust      = (int)[d integerForKey:kPrefGearAdjKey];
+    uscClampPrefs();
+}
+
+static void uscSavePrefs(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    uscClampPrefs();
+    [d setInteger:scrollSpeedType     forKey:kPrefSpeedKey];
+    [d setInteger:autoForceMultiplier forKey:kPrefForceKey];
+    [d setInteger:autoDisableMinutes  forKey:kPrefAutoStopKey];
+    [d setBool:keepScreenAwake        forKey:kPrefKeepAwakeKey];
+    [d setInteger:cornerGestureSide   forKey:kPrefCornerSideKey];
+    [d setInteger:gearSpeedAdjust     forKey:kPrefGearAdjKey];
+    // 不调 synchronize：现代 iOS 上它是 no-op 且会阻塞主线程，defaults 自己会异步落盘
+}
 
 // 速度档位名（菜单显示用）
 static NSString *speedName(int type) {
@@ -202,24 +255,43 @@ static const NSTimeInterval kMenuCornerHold = 0.6;
 // 没有可滚的距离，接管只会打断它自己的回弹/动画，看起来就是卡住
 static const float kMinScrollableTravel = 120.0f;
 
-// per-app 禁用 key（原版用全局 key，UI 写 "Disable for this app" 但实际禁用所有 app）
-static NSString *disabledKey() {
-    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
-    return [NSString stringWithFormat:@"uiscroller_disabled_%@", bid];
+// ── per-app 禁用 key ──
+// 原版用全局 key，UI 写 "Disable for this app" 但实际禁用所有 app；现改为拼 bundle id。
+// 性能注意：这三个函数会在 `%hook UIWindow sendEvent:` 的**每个触摸事件**里被读到
+// （uscTrackThreeFinger: / uscTrackCorner:），原来每次都现算，等于每个触摸事件做
+// NSBundle.mainBundle.bundleIdentifier 属性读取 + `stringWithFormat:` 堆分配 —— 120Hz 触摸采样下
+// 每秒数百次纯浪费。bundleIdentifier 在一个进程内恒定，故用 dispatch_once 只构造一次。
+// 注意只缓存 **key**，不缓存对应的 BOOL 值：值必须每次现读，否则跨 App 切回后开关状态会滞后
+// （这正是上一版 uscTFEnabled 全局缓存的坑，见 uscTrackThreeFinger: 的说明）。
+static NSString *disabledKey(void) {
+    static NSString *k = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        k = [NSString stringWithFormat:@"uiscroller_disabled_%@", NSBundle.mainBundle.bundleIdentifier ?: @""];
+    });
+    return k;
 }
 
 // 左下角长按菜单手势的 per-app 禁用 key：部分 App 底部角落有自己的长按功能
 // （拖拽排序、清除角标等），这种 App 在菜单里关掉角落手势即可 —— 三指长按仍可弹菜单。
-static NSString *cornerDisabledKey() {
-    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
-    return [NSString stringWithFormat:@"uiscroller_corner_disabled_%@", bid];
+static NSString *cornerDisabledKey(void) {
+    static NSString *k = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        k = [NSString stringWithFormat:@"uiscroller_corner_disabled_%@", NSBundle.mainBundle.bundleIdentifier ?: @""];
+    });
+    return k;
 }
 
 // 三指长按菜单手势的 per-app 禁用 key：与角落手势一致，按 App 单独开关。
 // 三指交互冲突概率比角落低，但某些 App 自身有三指手势（如三指撤销/缩放），仍可能误触，故同样支持按 App 关。
-static NSString *threeFingerDisabledKey() {
-    NSString *bid = NSBundle.mainBundle.bundleIdentifier ?: @"";
-    return [NSString stringWithFormat:@"uiscroller_threefinger_disabled_%@", bid];
+static NSString *threeFingerDisabledKey(void) {
+    static NSString *k = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        k = [NSString stringWithFormat:@"uiscroller_threefinger_disabled_%@", NSBundle.mainBundle.bundleIdentifier ?: @""];
+    });
+    return k;
 }
 
 // 判断 scroll view 是否在 WKWebView/UIWebView 内部（往 WKScrollView 上挂 tap 会让网页输入框点不动）
@@ -529,6 +601,7 @@ static void editAutoStopMinutes(void) {
         if (minutes < 0) minutes = 0;
         if (minutes > 180) minutes = 180;
         autoDisableMinutes = minutes;
+        uscSavePrefs();   // 落盘：切 App / 重启后仍是这个值
         if (cpAutoStopValue) cpAutoStopValue.text = minutes == 0 ? @"关闭" : [NSString stringWithFormat:@"%d 分钟", minutes];
     }];
     [inputAlert addAction:confirm];
@@ -558,10 +631,12 @@ static void editAutoStopMinutes(void) {
 @implementation USControlPanelProxy
 - (void)cp_speedChanged:(UISegmentedControl *)seg {
     scrollSpeedType = (int)seg.selectedSegmentIndex;
+    uscSavePrefs();
     cpRefreshSummary();
 }
 - (void)cp_multChanged:(UISegmentedControl *)seg {
     autoForceMultiplier = 50 + (int)seg.selectedSegmentIndex * 50; // 0.5×/1×/1.5×/2×
+    uscSavePrefs();
     cpRefreshSummary();
 }
 - (void)cp_cornerChanged:(UISegmentedControl *)seg {
@@ -569,6 +644,7 @@ static void editAutoStopMinutes(void) {
         cpSetCornerEnabled(NO);
     } else {
         cornerGestureSide = (int)seg.selectedSegmentIndex;
+        uscSavePrefs();          // 位置本身是全局偏好，落盘
         cpSetCornerEnabled(YES); // 切位置顺手把"关"状态解开
     }
     cpRefreshSummary();
@@ -582,10 +658,12 @@ static void editAutoStopMinutes(void) {
     if (snapped > 100) snapped = 100;
     if (snapped < -100) snapped = -100;
     gearSpeedAdjust = snapped;
+    uscSavePrefs();
     if (cpAdjustValue) cpAdjustValue.text = [NSString stringWithFormat:@"%+d pt/s", snapped];
 }
 - (void)cp_awakeChanged:(UISwitch *)sw {
     keepScreenAwake = sw.on;
+    uscSavePrefs();
     // 关闭时正在进行的滚动会在 stop 路径里自动还原息屏策略（restoreKeepAwake）
 }
 - (void)cp_editStop {
@@ -602,8 +680,9 @@ static void editAutoStopMinutes(void) {
 - (void)cp_pan:(UIPanGestureRecognizer *)pan {
     // 拖拽开始时再次确认覆盖窗口是 key：万一开菜单后 key 状态被 App 抢回，这里即时补回，
     // 保证后续 touchesMoved 流稳定（解决"拉手偶尔拉不下 / 拉着才跟手"的残留问题）。
-    if (pan.state == UIGestureRecognizerStateBegan && uscOverlayWindow().hidden == NO && !uscOverlayWindow().isKeyWindow) {
-        [uscOverlayWindow() makeKeyWindow];
+    UIWindow *ov = uscOverlayWindow();
+    if (pan.state == UIGestureRecognizerStateBegan && ov.hidden == NO && !ov.isKeyWindow) {
+        [ov makeKeyWindow];
     }
     UIView *panel = controlPanel;
     if (!panel) return;
@@ -662,13 +741,16 @@ void openSimpleMenu() {
             }
         }
     }
-    if (activeScene) uscOverlayWindow().windowScene = activeScene;
-    UIView *container = uscOverlayWindow().rootViewController.view;
-    uscOverlayWindow().hidden = NO;
+    // 提成局部变量：同一表达式里重复调用 uscOverlayWindow() 现在靠 dispatch_once 兜着不会出错，
+    // 但一旦将来改成"可重建窗口"就会变成隐性 bug（两次调用返回不同对象）。
+    UIWindow *ov = uscOverlayWindow();
+    if (activeScene) ov.windowScene = activeScene;
+    UIView *container = ov.rootViewController.view;
+    ov.hidden = NO;
     // 让覆盖窗口成为 key window：非 key 的高 level 窗口在连续手势（拖拽面板）的触摸投递上
     // 不稳定，表现为"拉着没反应、拉着拉着才跟手"。成为 key 后触摸稳定。
     // 记住原 key window，关闭时还原，不抢 App 的 firstResponder / 键盘。
-    [uscOverlayWindow() makeKeyWindow];
+    [ov makeKeyWindow];
     menuBusy = YES;
 
     // 背景：轻遮罩，点击即关
@@ -918,7 +1000,8 @@ void openSimpleMenu() {
         // 打开动画结束后再次确认覆盖窗口是 key：开菜单期间 App 可能在某次事件里把自身窗口重新
         // key 回来，导致高 level 窗口丢掉 key 状态、连续拖拽手势的 touchesMoved 流不稳
         // （"拉手下不去 / 拉着拉着才跟手" 的残留抖动）。这里补回，确保用户开始拖时窗口已是 key。
-        if (uscOverlayWindow().hidden == NO) [uscOverlayWindow() makeKeyWindow];
+        // ov 由上方局部变量捕获，不必再调 uscOverlayWindow()
+        if (ov.hidden == NO) [ov makeKeyWindow];
     }];
 }
 
@@ -937,14 +1020,19 @@ void openSimpleMenu() {
         NSSet<UITouch *> *all = [event allTouches];
         UITouch *candidate = nil;
         NSInteger downCount = 0;
+        // 半径先取平方，循环里只做平方和比较 —— 省掉每根手指一次 sqrt。
+        // 这是热路径（每个触摸事件都走），窗口尺寸也一并提到循环外。
+        CGFloat w = CGRectGetWidth(self.bounds);
+        CGFloat h = CGRectGetHeight(self.bounds);
+        CGFloat r2 = (CGFloat)kMenuCornerRadius * (CGFloat)kMenuCornerRadius;
         for (UITouch *t in all) {
             UITouchPhase p = t.phase;
             if (p == UITouchPhaseBegan || p == UITouchPhaseMoved || p == UITouchPhaseStationary) {
                 downCount++;
                 CGPoint loc = [t locationInView:self];
-                CGFloat dx = (cornerGestureSide == 1) ? (CGRectGetWidth(self.bounds) - loc.x) : loc.x;
-                CGFloat dy = loc.y - CGRectGetHeight(self.bounds);
-                if (sqrt(dx * dx + dy * dy) <= (CGFloat)kMenuCornerRadius) candidate = t;
+                CGFloat dx = (cornerGestureSide == 1) ? (w - loc.x) : loc.x;
+                CGFloat dy = loc.y - h;
+                if (dx * dx + dy * dy <= r2) candidate = t;
             }
         }
         if (candidate && downCount == 1) {
@@ -1219,7 +1307,6 @@ void openSimpleMenu() {
         // 之前只在那里设置，微信里"力道滑动开了常亮照样锁屏"就是漏了这里
         [self applyKeepAwakeIfEnabled];
         // 记录续滚起点：贴边检测基准（offset + 时刻）配合 kAutoV0Key（松手实测速度）恒速续滚
-        objc_setAssociatedObject(self, kAutoStartTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1632,9 +1719,12 @@ void openSimpleMenu() {
     // 用户 App（/var/containers/Bundle/Application）+ 系统 App（/Applications/，如照片、Safari、设置）。
     // 守护进程在 /usr/libexec、/System/Library 下，SpringBoard 在 /System/Library/CoreServices，
     // 都不匹配，所以不会被注入（系统 App 里出问题可在菜单里"禁用此应用"）。
+    // 注：用 containsString 匹配，所以 /private/var/containers/Bundle/Application（/var/containers 的
+    // 规范 realpath 形态，部分进程的 arguments[0] 走这一形态）天然已被第一条覆盖，无需另加判断。
     NSString *executablePath = NSProcessInfo.processInfo.arguments[0];
     if ([executablePath containsString:@"/var/containers/Bundle/Application"] ||
         [executablePath containsString:@"/Applications/"]) {
+        uscLoadPrefs(); // 载入上次的档位/倍率/常亮等偏好（默认值见变量声明处）
         %init;
         // 只有确认 UIScrollView 真的实现了这个私有方法，才挂载"续住系统动画"的钩子
         if (class_getInstanceMethod([UIScrollView class], @selector(_smoothScrollWithUpdateTime:))) {
