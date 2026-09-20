@@ -99,7 +99,7 @@ int autoDisableMinutes = 0; // 0: Disabled, >0: Minutes until auto-disable【不
 BOOL keepScreenAwake = NO;  // 自动滚动期间禁止息屏（默认关，菜单里可开）【不持久化，每次启动回关】
 int autoForceMultiplier = 100; // 自动档力道倍率（%）：100=1×，菜单可选 0.5/1/1.5/2【per-App 持久化】
 int cornerGestureSide = 0;  // 角落手势位置：0=左下 1=右下（可按 App 禁用，见 cornerDisabledKey）【per-App 持久化】
-int gearSpeedAdjust = 0;    // 固定挡速度微调（pt/s）：菜单 ±100 细调基准档位【per-App 持久化】
+int gearSpeedAdjust = 0;    // 固定挡速度微调（pt/s）：菜单 ±100 细调基准档位【不持久化，每次启动回 0】
 
 // ── 设置存储 ──
 // 【先把结论写死，别再返工】本项目**做不到"跨 App 的全局设置"**，两条路都堵死了：
@@ -109,17 +109,19 @@ int gearSpeedAdjust = 0;    // 固定挡速度微调（pt/s）：菜单 ±100 �
 //      也没用 —— 在沙箱进程里 cfprefsd 会把"任意用户/任意主机"的写请求**静默重定向回本 App 容器**，
 //      而且 API 无返回值可判、不报错、连文件存在性探测都会误导。真机表现就是"改了共享路径还是一样"。
 //   要真跨 App，只有起常驻进程（LaunchDaemon 或 SpringBoard 中转 + IPC）—— 代码量/常驻开销远超
-//   这几项设置的收益，明确不做。所以：**所有设置都落 standardUserDefaults**。
+//   这几项设置的收益，明确不做。所以：**要持久化就只用 standardUserDefaults**（做不到全局，
+//   那不如少存几项、存的那几项老老实实 per-App）。
 // 按要不要记住分两类：
-//   ① 持久化的（力道倍率 / 挡位微调 / 角落位置）：写 standardUserDefaults。
+//   ① 持久化的（力道倍率 / 角落位置）：写 standardUserDefaults。
 //      是 per-App 的 —— 切 App 不会串，同 App 重启不丢（比不存强，这是沙箱内的上限）。
-//   ② 不持久化的（速度档位 / 屏幕常亮 / 自动停止分钟数）：纯进程内变量，每次启动回默认。
-//      * 速度档位回 **自动档（4）** —— 自动档是主力用法（跟随滑动力道），
-//        固定挡只作临时选择，没必要记；
+//      这两项是"口味/布局偏好"，重设很烦，值得记。
+//   ② 不持久化的（速度档位 / 挡位微调 / 屏幕常亮 / 自动停止分钟数）：纯进程内变量，每次启动回默认。
+//      * 速度档位回 **自动档（4）** —— 自动档是主力用法（跟随滑动力道），固定挡只作临时选择；
+//      * 挡位微调回 0 —— 它只对固定挡生效，而档位每次都回自动档，
+//        跟着一起回 0 才是自洽的（否则"档位已重置、微调还留着"，行为对不上）；
 //      * 常亮回关（不会莫名一直亮屏）；
 //      * 自动停止回 0（不会莫名自己把滚动关掉）。
 static NSString *const kPrefForceKey      = @"uiscroller_pref_force";       // 50-200 (%)
-static NSString *const kPrefGearAdjKey    = @"uiscroller_pref_gearadjust";  // -100..100 (pt/s)
 static NSString *const kPrefCornerSideKey = @"uiscroller_pref_cornerside";  // 0/1
 
 // 数值范围钳制：用户手改 plist / 旧版本残留 / 越界值都要挡住。
@@ -140,12 +142,11 @@ static void uscClampPrefs(void) {
 static void uscLoadPrefs(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     // 用 objectForKey 判"键是否存在"，而不是拿"值是否 0"当"没设过"——
-    // 用户主动设成的 0 是合法值（角落位置的 0 = 左下、微调的 0 = 不偏移），必须能和"从未设置"区分开
+    // 用户主动设成的 0 是合法值（角落位置的 0 = 左下），必须能和"从未设置"区分开
     if ([ud objectForKey:kPrefForceKey])      autoForceMultiplier = (int)[ud integerForKey:kPrefForceKey];
-    if ([ud objectForKey:kPrefGearAdjKey])    gearSpeedAdjust     = (int)[ud integerForKey:kPrefGearAdjKey];
     if ([ud objectForKey:kPrefCornerSideKey]) cornerGestureSide   = (int)[ud integerForKey:kPrefCornerSideKey];
-    // scrollSpeedType / keepScreenAwake / autoDisableMinutes 故意不读：
-    // 保持声明处的默认值（自动档 4 / NO / 0），即"不持久化"
+    // scrollSpeedType / gearSpeedAdjust / keepScreenAwake / autoDisableMinutes 故意不读：
+    // 保持声明处的默认值（自动档 4 / 0 / NO / 0），即"不持久化"
     uscClampPrefs();
 }
 
@@ -153,10 +154,9 @@ static void uscSavePrefs(void) {
     uscClampPrefs();
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setInteger:autoForceMultiplier forKey:kPrefForceKey];
-    [ud setInteger:gearSpeedAdjust     forKey:kPrefGearAdjKey];
     [ud setInteger:cornerGestureSide   forKey:kPrefCornerSideKey];
-    // scrollSpeedType / keepScreenAwake / autoDisableMinutes 故意不写：
-    // 这三个不持久化（见上方"设置存储"说明）
+    // scrollSpeedType / gearSpeedAdjust / keepScreenAwake / autoDisableMinutes 故意不写：
+    // 这四项不持久化（见上方"设置存储"说明）
     // 不调 synchronize：现代 iOS 上它是 no-op 且会阻塞主线程，defaults 自己会异步落盘
 }
 
@@ -666,11 +666,10 @@ static void editAutoStopMinutes(void) {
     int snapped = (int)lroundf(slider.value / 20.0f) * 20; // 20 pt/s 步进，避免拖出零碎值
     if (snapped > 100) snapped = 100;
     if (snapped < -100) snapped = -100;
-    // 拖拽时 valueChanged 每帧都回调，而 setInteger: 会触发 defaults 落盘调度，绝不能每帧写。
-    // 值没变就直接返回 —— 按 20pt/s 步进，整条滑杆拖完也只写几次。
+    // 不落盘：挡位微调不持久化（它只对固定挡生效，而档位每次都回自动档，一起回 0 才自洽）
+    // 拖拽时 valueChanged 每帧都回调 —— 值没变就直接返回，省掉每帧一次多余的标签刷新
     if (snapped == gearSpeedAdjust) return;
     gearSpeedAdjust = snapped;
-    uscSavePrefs();
     if (cpAdjustValue) cpAdjustValue.text = [NSString stringWithFormat:@"%+d pt/s", snapped];
 }
 - (void)cp_awakeChanged:(UISwitch *)sw {
@@ -1736,8 +1735,8 @@ void openSimpleMenu() {
     NSString *executablePath = NSProcessInfo.processInfo.arguments[0];
     if ([executablePath containsString:@"/var/containers/Bundle/Application"] ||
         [executablePath containsString:@"/Applications/"]) {
-        uscLoadPrefs(); // 载入持久化设置：力道倍率 / 挡位微调 / 角落位置（per-App，各自一份）
-                        // 不持久化的三项用声明处默认值：档位=自动档(4)、常亮=NO、自动停止=0
+        uscLoadPrefs(); // 载入持久化设置：力道倍率 / 角落位置（per-App，每个 App 各自一份）
+                        // 不持久化的四项用声明处默认值：档位=自动档(4)、挡位微调=0、常亮=NO、自动停止=0
         %init;
         // 只有确认 UIScrollView 真的实现了这个私有方法，才挂载"续住系统动画"的钩子
         if (class_getInstanceMethod([UIScrollView class], @selector(_smoothScrollWithUpdateTime:))) {
