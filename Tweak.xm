@@ -2,6 +2,8 @@
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
 #import <math.h>
+// 跨 App 的全局设置走 CFPreferences（AnyUser + AnyHost）——必须显式引入，别依赖传递包含
+#import <CoreFoundation/CoreFoundation.h>
 
 @interface UIScrollView (UIScroller)
 @property (nonatomic,readonly) UIPanGestureRecognizer *panGestureRecognizer;
@@ -99,18 +101,62 @@ int autoForceMultiplier = 100; // 自动档力道倍率（%）：100=1×，菜�
 int cornerGestureSide = 0;  // 角落手势位置：0=左下 1=右下（可按 App 禁用，见 cornerDisabledKey）
 int gearSpeedAdjust = 0;    // 固定挡速度微调（pt/s）：菜单 ±100 细调基准档位
 
-// ── 设置持久化 ──
-// 上面 6 个变量以前是纯进程内全局：只在面板里赋值，App 一退出（或被系统回收）就回默认。
-// 每个 App 都是独立进程，所以"在 A 里调好较快+1.5×+常亮，切到 B 全部回默认"——这是实打实的体验缺口。
-// 现在在 %ctor 里载入、每个 setter 里落盘。
-// 存**全局**而非 per-app：档位/倍率/常亮是用户的使用习惯，不是某个 App 的特性。
-// （"禁用"类开关才需要 per-app，见 disabledKey / cornerDisabledKey / threeFingerDisabledKey。）
-static NSString *const kPrefSpeedKey      = @"uiscroller_pref_speed";       // 0-4
-static NSString *const kPrefForceKey      = @"uiscroller_pref_force";       // 50-200 (%)
+// ── 设置存储：两种作用域，别搞混 ──
+// 【关键事实 · 上一版返工的根因】`NSUserDefaults standardUserDefaults` 是**按 App 沙盒隔离**的：
+// 每个 App 有各自的 `Library/Preferences/<bundleid>.plist`。所以往它里面写"跨 App 的全局设置"
+// 本身就是无效的 —— 那不是"没存住"，而是**存到了本 App 私有域**，切 App 自然读不到。
+// 现在按需求分两种作用域：
+//   ① 跨 App（全局）：速度档位 / 力道倍率 / 屏幕常亮 / 挡位微调 —— 属使用习惯，切 App 应保持。
+//      实现：CFPreferences 的 **AnyUser + AnyHost**，落在 /var/mobile/Library/Preferences/<domain>.plist，
+//      所有进程共享同一份（CFPreferences 自带跨进程合并，比手写 plist 文件安全）。
+//   ② per-App：自动停止分钟数 / 角落手势位置 —— 用户明确要求"各管各的"（不同 App 场景不同，
+//      分开设置更方便）。实现：就用 standardUserDefaults，它天然 per-app，无需额外处理。
+// 兜底：roothide 下不保证沙箱允许写全局路径，故首次写入后校验文件是否真的落盘，
+// 写不进去就整体退回 standardUserDefaults（至少 per-App 能存住），**绝不静默丢设置**。
+static NSString *const kSharedDomain    = @"com.yxh41.uiscroller";
+static NSString *const kSharedPlistPath = @"/var/mobile/Library/Preferences/com.yxh41.uiscroller.plist";
+static BOOL uscSharedOK = YES;   // 全局域是否可写（首次写入后探测，失败则整体退回 per-App）
+
+// 全局键（跨 App，共享域用短名）
+static NSString *const kPrefSpeedKey     = @"speed";       // 0-4
+static NSString *const kPrefForceKey     = @"force";       // 50-200 (%)
+static NSString *const kPrefKeepAwakeKey = @"keepawake";   // bool
+static NSString *const kPrefGearAdjKey   = @"gearadjust";  // -100..100 (pt/s)
+// per-App 键（standardUserDefaults，天然按 App 隔离）
 static NSString *const kPrefAutoStopKey   = @"uiscroller_pref_autostop";    // 0-180 (min)
-static NSString *const kPrefKeepAwakeKey  = @"uiscroller_pref_keepawake";   // bool
 static NSString *const kPrefCornerSideKey = @"uiscroller_pref_cornerside";  // 0/1
-static NSString *const kPrefGearAdjKey    = @"uiscroller_pref_gearadjust";  // -100..100 (pt/s)
+
+// 全局域读：共享域查不到时退回 per-App 同名键。
+// 这个退回是给 uscSharedSet 的降级路径用的（全局写不动时会把值写进 per-App 同名键），
+// 保证即使降级成 per-App 也能自洽读回。
+// 注意：上一版把这几项写成了 per-App 的 uiscroller_pref_* 键名，本次不再使用该键名，
+// 所以**不做旧值迁移**（升级后这几项会回到默认值，需重设一次，属一次性成本）。
+static id uscSharedGet(NSString *key) {
+    CFPropertyListRef v = CFPreferencesCopyValue((__bridge CFStringRef)key,
+                                                 (__bridge CFStringRef)kSharedDomain,
+                                                 kCFPreferencesAnyUser,
+                                                 kCFPreferencesAnyHost);
+    if (v) return (__bridge_transfer id)v;
+    return [[NSUserDefaults standardUserDefaults] objectForKey:key];
+}
+
+// 全局域写：写不动（沙箱拒绝）就退回 per-App，并记住这个事实，后续不再重试全局
+static void uscSharedSet(NSString *key, id value) {
+    if (!uscSharedOK) {
+        [[NSUserDefaults standardUserDefaults] setObject:value forKey:key];
+        return;
+    }
+    CFPreferencesSetValue((__bridge CFStringRef)key, (__bridge CFPropertyListRef)value,
+                          (__bridge CFStringRef)kSharedDomain,
+                          kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    CFPreferencesSynchronize((__bridge CFStringRef)kSharedDomain,
+                             kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    // CFPreferences 被沙箱拒绝时可能"静默成功"（API 无返回值可判）→ 以文件是否真的存在为准
+    if (![[NSFileManager defaultManager] fileExistsAtPath:kSharedPlistPath]) {
+        uscSharedOK = NO;
+        [[NSUserDefaults standardUserDefaults] setObject:value forKey:key];
+    }
+}
 
 // 数值范围钳制：用户手改 plist / 旧版本残留 / 越界值都要挡住。
 // 尤其是 scrollSpeedType —— 它同时用作 kGearSpeed[] 数组下标和 UISegmentedControl.selectedSegmentIndex，
@@ -128,26 +174,31 @@ static void uscClampPrefs(void) {
 }
 
 static void uscLoadPrefs(void) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    // 用 objectForKey 判"是否存在"，而不是直接读值 —— 否则用户主动设成 0/NO 会被当成未设置而回默认
-    if ([d objectForKey:kPrefSpeedKey])      scrollSpeedType      = (int)[d integerForKey:kPrefSpeedKey];
-    if ([d objectForKey:kPrefForceKey])      autoForceMultiplier  = (int)[d integerForKey:kPrefForceKey];
-    if ([d objectForKey:kPrefAutoStopKey])   autoDisableMinutes   = (int)[d integerForKey:kPrefAutoStopKey];
-    if ([d objectForKey:kPrefKeepAwakeKey])  keepScreenAwake      = [d boolForKey:kPrefKeepAwakeKey];
-    if ([d objectForKey:kPrefCornerSideKey]) cornerGestureSide    = (int)[d integerForKey:kPrefCornerSideKey];
-    if ([d objectForKey:kPrefGearAdjKey])    gearSpeedAdjust      = (int)[d integerForKey:kPrefGearAdjKey];
+    // ① 跨 App 的 4 项：共享域（读不到会退回 per-App，完成旧值迁移）
+    id v;
+    if ((v = uscSharedGet(kPrefSpeedKey)))     scrollSpeedType     = [v intValue];
+    if ((v = uscSharedGet(kPrefForceKey)))     autoForceMultiplier = [v intValue];
+    if ((v = uscSharedGet(kPrefKeepAwakeKey))) keepScreenAwake     = [v boolValue];
+    if ((v = uscSharedGet(kPrefGearAdjKey)))   gearSpeedAdjust     = [v intValue];
+    // ② per-App 的 2 项：standardUserDefaults（每个 App 各自一份，符合"各管各的"）
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    // 用 objectForKey 判"是否存在"，否则用户主动设成 0/NO 会被当成未设置而回默认
+    if ([ud objectForKey:kPrefAutoStopKey])   autoDisableMinutes = (int)[ud integerForKey:kPrefAutoStopKey];
+    if ([ud objectForKey:kPrefCornerSideKey]) cornerGestureSide   = (int)[ud integerForKey:kPrefCornerSideKey];
     uscClampPrefs();
 }
 
 static void uscSavePrefs(void) {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     uscClampPrefs();
-    [d setInteger:scrollSpeedType     forKey:kPrefSpeedKey];
-    [d setInteger:autoForceMultiplier forKey:kPrefForceKey];
-    [d setInteger:autoDisableMinutes  forKey:kPrefAutoStopKey];
-    [d setBool:keepScreenAwake        forKey:kPrefKeepAwakeKey];
-    [d setInteger:cornerGestureSide   forKey:kPrefCornerSideKey];
-    [d setInteger:gearSpeedAdjust     forKey:kPrefGearAdjKey];
+    // ① 跨 App 的 4 项 → 共享域
+    uscSharedSet(kPrefSpeedKey,     @(scrollSpeedType));
+    uscSharedSet(kPrefForceKey,     @(autoForceMultiplier));
+    uscSharedSet(kPrefKeepAwakeKey, @(keepScreenAwake));
+    uscSharedSet(kPrefGearAdjKey,   @(gearSpeedAdjust));
+    // ② per-App 的 2 项 → standardUserDefaults
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setInteger:autoDisableMinutes  forKey:kPrefAutoStopKey];
+    [ud setInteger:cornerGestureSide   forKey:kPrefCornerSideKey];
     // 不调 synchronize：现代 iOS 上它是 no-op 且会阻塞主线程，defaults 自己会异步落盘
 }
 
@@ -657,6 +708,9 @@ static void editAutoStopMinutes(void) {
     int snapped = (int)lroundf(slider.value / 20.0f) * 20; // 20 pt/s 步进，避免拖出零碎值
     if (snapped > 100) snapped = 100;
     if (snapped < -100) snapped = -100;
+    // 拖拽时 valueChanged 每帧都回调，而全局域写盘带 CFPreferencesSynchronize（同步 I/O），
+    // 绝不能每帧写。值没变就直接返回 —— 按 20pt/s 步进，整条滑杆拖完也只写几次。
+    if (snapped == gearSpeedAdjust) return;
     gearSpeedAdjust = snapped;
     uscSavePrefs();
     if (cpAdjustValue) cpAdjustValue.text = [NSString stringWithFormat:@"%+d pt/s", snapped];

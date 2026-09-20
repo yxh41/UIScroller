@@ -7,7 +7,7 @@ THEOS_DEVICE_PORT = 2222
 TWEAK_NAME = UIScroller
 $(TWEAK_NAME)_FILES = Tweak.xm
 $(TWEAK_NAME)_CFLAGS = -fobjc-arc
-$(TWEAK_NAME)_FRAMEWORKS = UIKit QuartzCore
+$(TWEAK_NAME)_FRAMEWORKS = UIKit QuartzCore CoreFoundation
 
 ARCHS = arm64e arm64
 FINALPACKAGE = 1
