@@ -16,6 +16,11 @@ env:
 jobs:
   build:
     runs-on: macos-15
+    # ci-artifacts 分支要靠 GITHUB_TOKEN 推上去。不显式声明的话，若仓库把
+    # Settings > Actions > General > Workflow permissions 设成只读，push 会 403。
+    # 注意：此处声明的上限受仓库设置约束，声明 write 也不能超过仓库允许的范围。
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -166,9 +171,19 @@ jobs:
           ls -la uiscroller-roothide.deb
           git add -f uiscroller-roothide.deb
           git commit -m "roothide deb $(date -u +%Y-%m-%dT%H:%M:%SZ) $(basename "$DEB")"
-          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-artifacts \
-            && echo "PUSHED ci-artifacts: uiscroller-roothide.deb" \
-            || echo "::warning::push ci-artifacts failed (artifact 仍可用)"
+          # 刻意不用 `git push ... | tee`（管道退出码取 tee 的，失败会被吞掉），
+          # 也不用 `|| echo`（那会让 step 恒为 success —— "没报错=通过了"是假绿灯）。
+          set +e
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-artifacts > /tmp/push.log 2>&1
+          RC=$?
+          set -e
+          cat /tmp/push.log
+          if [ $RC -eq 0 ]; then
+            echo "PUSHED ci-artifacts: uiscroller-roothide.deb"
+          else
+            MSG=$(tail -n 3 /tmp/push.log | tr '\n' ' ' | cut -c1-200)
+            echo "::error file=Makefile::ci-artifacts push FAILED rc=$RC: $MSG"
+          fi
 
       # Token-free fallback: even with a read-only GITHUB_TOKEN the built .deb
       # is unreadable via artifacts/branches/statuses, so emit it as base64 that
