@@ -4,9 +4,6 @@
 #import <math.h>
 // CFTimeInterval 等 CF 基础类型用（经 Foundation 传递包含也能过，显式写明更稳）
 #import <CoreFoundation/CoreFoundation.h>
-// 探针用（uscProbe）：va_list / fopen，显式包含避免依赖 Foundation 的传递包含
-#import <stdarg.h>
-#import <stdio.h>
 
 @interface UIScrollView (UIScroller)
 @property (nonatomic,readonly) UIPanGestureRecognizer *panGestureRecognizer;
@@ -224,26 +221,6 @@ static void uscResolveOffsets(void) {
     uscFacOffset = f ? ivar_getOffset(f) : -1;
 }
 
-// ── 临时探针（第 18 轮）：定性「自动档到底后到底等了几秒、走的是哪条驱动」──
-// 双通道输出：系统日志（idevicesyslog 可看）+ 文件（Filza 直接看，不必接电脑）。
-// 只在低频事件点调用（甩动 / 进入贴边 / 到底），不在每帧路径上，开销可忽略。
-// 用 C 的 fopen/写/关，不碰 NSFileHandle（后者写失败会抛异常）。
-static void uscProbe(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSLog(@"[USC] %@", msg);
-    NSString *line = [NSString stringWithFormat:@"%.5f  %@\n", CACurrentMediaTime(), msg];
-    NSArray<NSString *> *ps = @[ @"/var/mobile/usc_probe.log",
-                                 [NSHomeDirectory() stringByAppendingPathComponent:@"usc_probe.log"] ];
-    for (NSString *p in ps) {
-        FILE *f = fopen(p.fileSystemRepresentation, "a");
-        if (!f) continue;
-        fputs(line.UTF8String, f);
-        fclose(f);
-    }
-}
 
 static inline double *usc_velPtr(id obj) {
     if (uscVelOffset < 0) uscResolveOffsets();
@@ -1227,8 +1204,6 @@ void openSimpleMenu() {
             objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(vSrc)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kAutoV0Key, @(fabs(vSrc)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             // 自动档：优先让系统自己的滚动动画续滚；私有方法不可用时退回我们的驱动
-            uscProbe(@"甩动 speedType=%d broken=%d -> %@", scrollSpeedType, (int)nativeSustainBroken,
-                     nativeSustainBroken ? @"自有驱动(贴边1.0s)" : @"原生续滚(贴边0.3s)");
             if (nativeSustainBroken) [self startUIScroller];
             else [self startAutoNative];
             return r;
@@ -1624,16 +1599,12 @@ void openSimpleMenu() {
             CFTimeInterval nowE = CACurrentMediaTime();
             id waitStart = objc_getAssociatedObject(self, kEdgeWaitKey);
             if (!waitStart) {
-                uscProbe(@"到底·自有驱动 进入贴边等待 speedType=%d y=%.1f max=%.1f 高=%.1f",
-                         scrollSpeedType, self.contentOffset.y, maxOffset, self.contentSize.height);
                 objc_setAssociatedObject(self, kEdgeWaitKey, @(nowE), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kEdgeWaitSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 waitStart = @(nowE);
             }
             // 等到了新内容（内容变高）-> 重新起算继续滚
             if (self.contentSize.height - [objc_getAssociatedObject(self, kEdgeWaitSizeKey) doubleValue] > 1.0) {
-                uscProbe(@"到底·自有驱动 等到更多内容(%.1f->%.1f) 继续滚",
-                         [objc_getAssociatedObject(self, kEdgeWaitSizeKey) doubleValue], self.contentSize.height);
                 objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1643,8 +1614,6 @@ void openSimpleMenu() {
             }
             // 等太久还是没新内容 -> 认为真的到底/到顶了（轻震提示）
             if (nowE - [waitStart doubleValue] > kEdgeWaitTimeout) {
-                uscProbe(@"到底·自有驱动 贴边等待%.3fs 仍无更多内容 -> 停(阈值%.2f)",
-                         nowE - [waitStart doubleValue], kEdgeWaitTimeout);
                 [self stopUIScroller];
                 UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
                 [h impactOccurred];
@@ -1706,8 +1675,6 @@ void openSimpleMenu() {
         double *facPtr = usc_facPtr(self);
         if (!velPtr || !facPtr) {
             // 私有 ivar 不存在（iOS 版本变了）-> 退回自有驱动
-            uscProbe(@"ivar 解析失败 vel=%p fac=%p off(%ld,%ld) -> 永久降级为自有驱动",
-                     velPtr, facPtr, (long)uscVelOffset, (long)uscFacOffset);
             nativeSustainBroken = YES;
             [self stopAutoNative];
             [self startUIScroller];
@@ -1748,20 +1715,14 @@ void openSimpleMenu() {
                 // 视觉上就是"到底后飞出去一截再弹回来"。压住速度后贴边即定、不越界。
                 objc_setAssociatedObject(self, kAutoEdgeStartKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kAutoEdgeSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                uscProbe(@"到底·原生续滚 首次贴边 y=%.1f eMax=%.1f v=%.4f -> 压住速度，等 %.2fs 看是否加载更多",
-                         y, eMax, v, kEdgeStallTime);
                 *velPtr = 0.0;
                 return;
             }
             if (self.contentSize.height - [objc_getAssociatedObject(self, kAutoEdgeSizeKey) doubleValue] > 1.0) {
                 // 贴边之后 App 又插入了新内容（加载更多）-> 清锁存，落到下面正常续滚
-                uscProbe(@"到底·原生续滚 出现更多内容(%.1f->%.1f) -> 继续滚",
-                         [objc_getAssociatedObject(self, kAutoEdgeSizeKey) doubleValue], self.contentSize.height);
                 objc_setAssociatedObject(self, kAutoEdgeStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kAutoEdgeSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             } else if (now - [edgeT doubleValue] > kEdgeStallTime) {
-                uscProbe(@"到底·原生续滚 贴边持续=%.3fs(阈值%.2f) y=%.1f eMax=%.1f v=%.4f -> 停",
-                         now - [edgeT doubleValue], kEdgeStallTime, y, eMax, v);
                 *velPtr = 0.0;
                 [self stopAutoNative];
                 // 到头提示：轻震一下，不用盯着看才知道自动滚动停了
@@ -1808,18 +1769,6 @@ void openSimpleMenu() {
         [executablePath containsString:@"/Applications/"]) {
         uscLoadPrefs(); // 载入持久化设置：力道倍率 / 角落位置（per-App，每个 App 各自一份）
                         // 不持久化的四项用声明处默认值：档位=自动档(4)、挡位微调=0、常亮=NO、自动停止=0
-        // ── 自动档能力自检（只打日志，不改行为）：决定 nativeSustainBroken 会不会被置 YES ──
-        // 必须在 %init 之前跑，看到的才是 UIKit 原始状态。
-        {
-            Ivar vIv = class_getInstanceVariable([UIScrollView class], "_verticalVelocity");
-            Ivar fIv = class_getInstanceVariable([UIScrollView class], "_decelerationFactor");
-            Method mSm = class_getInstanceMethod([UIScrollView class], @selector(_smoothScrollWithUpdateTime:));
-            uscProbe(@"自检 cls=%@ vel=%@(off=%ld) fac=%@(off=%ld) smooth=%@",
-                     [UIScrollView class] ? @"有" : @"无",
-                     vIv ? @"有" : @"无", (long)(vIv ? ivar_getOffset(vIv) : -1),
-                     fIv ? @"有" : @"无", (long)(fIv ? ivar_getOffset(fIv) : -1),
-                     mSm ? @"有" : @"无");
-        }
         %init;
         // 只有确认 UIScrollView 真的实现了这个私有方法，才挂载"续住系统动画"的钩子
         if (class_getInstanceMethod([UIScrollView class], @selector(_smoothScrollWithUpdateTime:))) {
