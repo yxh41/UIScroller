@@ -146,6 +146,30 @@ jobs:
           if-no-files-found: error
           retention-days: 90
 
+      # 把 .deb 推到 ci-artifacts 分支：artifact 下载 API 强制要求认证（匿名请求 401
+      # Requires authentication），而 git 分支只要仓库读权限就能取 —— 本地用 SSH 即可，
+      # 无需 PAT、无需登录网页。取法：
+      #   git fetch origin ci-artifacts
+      #   git show origin/ci-artifacts:uiscroller-roothide.deb > UIScroller.deb
+      - name: Publish .deb to ci-artifacts branch (token-free)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DEB=$(ls packages/*_iphoneos-arm64e.deb 2>/dev/null | head -n1)
+          [ -n "$DEB" ] || { echo "::warning::no deb to publish"; exit 0; }
+          git config user.email "ci@local"
+          git config user.name "CI"
+          git checkout --orphan ci-artifacts
+          git rm -rf --cached . >/dev/null 2>&1
+          cp "$DEB" ./uiscroller-roothide.deb
+          ls -la uiscroller-roothide.deb
+          git add -f uiscroller-roothide.deb
+          git commit -m "roothide deb $(date -u +%Y-%m-%dT%H:%M:%SZ) $(basename "$DEB")"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" ci-artifacts \
+            && echo "PUSHED ci-artifacts: uiscroller-roothide.deb" \
+            || echo "::warning::push ci-artifacts failed (artifact 仍可用)"
+
       # Token-free fallback: even with a read-only GITHUB_TOKEN the built .deb
       # is unreadable via artifacts/branches/statuses, so emit it as base64 that
       # the repo owner can copy straight from the Actions log and decode locally.
