@@ -1741,11 +1741,20 @@ void openSimpleMenu() {
         if (y >= eMax - 1.0 || y <= eMin + 1.0) {
             NSNumber *edgeT = objc_getAssociatedObject(self, kAutoEdgeStartKey);
             if (!edgeT) {
+                // 首次贴边：锁存起点，并**立刻把速度压到 0**。
+                // 真机实测（第 18 轮第二轮日志）：只锁存不压速度的话，这 0.3s 窗口里我们
+                // 每帧仍把速度续成 target，会把内容推进越界区 86pt
+                // （y=5536.3 vs eMax=5450.0，两次实测同为 86.3pt；顶部那次越界 100pt），
+                // 视觉上就是"到底后飞出去一截再弹回来"。压住速度后贴边即定、不越界。
                 objc_setAssociatedObject(self, kAutoEdgeStartKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kAutoEdgeSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                edgeT = @(now);
-            } else if (self.contentSize.height - [objc_getAssociatedObject(self, kAutoEdgeSizeKey) doubleValue] > 1.0) {
-                // 贴边之后 App 又插入了新内容（加载更多）-> 清锁存，重新起算继续滚
+                uscProbe(@"到底·原生续滚 首次贴边 y=%.1f eMax=%.1f v=%.4f -> 压住速度，等 %.2fs 看是否加载更多",
+                         y, eMax, v, kEdgeStallTime);
+                *velPtr = 0.0;
+                return;
+            }
+            if (self.contentSize.height - [objc_getAssociatedObject(self, kAutoEdgeSizeKey) doubleValue] > 1.0) {
+                // 贴边之后 App 又插入了新内容（加载更多）-> 清锁存，落到下面正常续滚
                 uscProbe(@"到底·原生续滚 出现更多内容(%.1f->%.1f) -> 继续滚",
                          [objc_getAssociatedObject(self, kAutoEdgeSizeKey) doubleValue], self.contentSize.height);
                 objc_setAssociatedObject(self, kAutoEdgeStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1758,6 +1767,10 @@ void openSimpleMenu() {
                 // 到头提示：轻震一下，不用盯着看才知道自动滚动停了
                 UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
                 [h impactOccurred];
+                return;
+            } else {
+                // 确认窗口期内：继续压住速度，一帧都不许往前推
+                *velPtr = 0.0;
                 return;
             }
         }
