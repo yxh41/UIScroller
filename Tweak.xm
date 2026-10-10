@@ -4,6 +4,9 @@
 #import <math.h>
 // CFTimeInterval 等 CF 基础类型用（经 Foundation 传递包含也能过，显式写明更稳）
 #import <CoreFoundation/CoreFoundation.h>
+// 探针用（uscProbe）：va_list / fopen，显式包含避免依赖 Foundation 的传递包含
+#import <stdarg.h>
+#import <stdio.h>
 
 @interface UIScrollView (UIScroller)
 @property (nonatomic,readonly) UIPanGestureRecognizer *panGestureRecognizer;
@@ -86,8 +89,10 @@ static const void *kEdgeWaitSizeKey     = &kEdgeWaitSizeKey;
 // ── 自动档：原生续滚（挂系统自己的滚动动画，不自己写 offset）──
 static const void *kAutoActiveKey       = &kAutoActiveKey;
 static const void *kAutoV0Key           = &kAutoV0Key;
-static const void *kAutoLastYKey        = &kAutoLastYKey;
-static const void *kAutoLastTKey        = &kAutoLastTKey;
+// 边界锁存：一旦 offset 贴到边界（含越界）就记下起点时刻 + 当时的内容高。
+// 用「位置」判到底而不是「位移」—— 原因见 _smoothScrollWithUpdateTime: 里的血泪说明。
+static const void *kAutoEdgeStartKey    = &kAutoEdgeStartKey;
+static const void *kAutoEdgeSizeKey     = &kAutoEdgeSizeKey;
 static const void *kOrigFactorKey       = &kOrigFactorKey;
 // 私有 API（_verticalVelocity）维持无效时置 YES：本进程内自动档退回我们自己的驱动
 static BOOL nativeSustainBroken = NO;
@@ -218,6 +223,28 @@ static void uscResolveOffsets(void) {
     uscVelOffset = v ? ivar_getOffset(v) : -1;
     uscFacOffset = f ? ivar_getOffset(f) : -1;
 }
+
+// ── 临时探针（第 18 轮）：定性「自动档到底后到底等了几秒、走的是哪条驱动」──
+// 双通道输出：系统日志（idevicesyslog 可看）+ 文件（Filza 直接看，不必接电脑）。
+// 只在低频事件点调用（甩动 / 进入贴边 / 到底），不在每帧路径上，开销可忽略。
+// 用 C 的 fopen/写/关，不碰 NSFileHandle（后者写失败会抛异常）。
+static void uscProbe(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[USC] %@", msg);
+    NSString *line = [NSString stringWithFormat:@"%.5f  %@\n", CACurrentMediaTime(), msg];
+    NSArray<NSString *> *ps = @[ @"/var/mobile/usc_probe.log",
+                                 [NSHomeDirectory() stringByAppendingPathComponent:@"usc_probe.log"] ];
+    for (NSString *p in ps) {
+        FILE *f = fopen(p.fileSystemRepresentation, "a");
+        if (!f) continue;
+        fputs(line.UTF8String, f);
+        fclose(f);
+    }
+}
+
 static inline double *usc_velPtr(id obj) {
     if (uscVelOffset < 0) uscResolveOffsets();
     if (uscVelOffset < 0) return NULL;
@@ -1200,6 +1227,8 @@ void openSimpleMenu() {
             objc_setAssociatedObject(self, kDragVelocityKey, @(fabs(vSrc)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             objc_setAssociatedObject(self, kAutoV0Key, @(fabs(vSrc)), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             // 自动档：优先让系统自己的滚动动画续滚；私有方法不可用时退回我们的驱动
+            uscProbe(@"甩动 speedType=%d broken=%d -> %@", scrollSpeedType, (int)nativeSustainBroken,
+                     nativeSustainBroken ? @"自有驱动(贴边1.0s)" : @"原生续滚(贴边0.3s)");
             if (nativeSustainBroken) [self startUIScroller];
             else [self startAutoNative];
             return r;
@@ -1317,9 +1346,9 @@ void openSimpleMenu() {
         // 屏幕常亮必须两条驱动路径都生效：原生续滚不走 startUIScroller，
         // 之前只在那里设置，微信里"力道滑动开了常亮照样锁屏"就是漏了这里
         [self applyKeepAwakeIfEnabled];
-        // 记录续滚起点：贴边检测基准（offset + 时刻）配合 kAutoV0Key（松手实测速度）恒速续滚
-        objc_setAssociatedObject(self, kAutoLastYKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(self, kAutoLastTKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        // 清掉上一轮会话的边界锁存（新一轮滚动重新判到底）
+        objc_setAssociatedObject(self, kAutoEdgeStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(self, kAutoEdgeSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         objc_setAssociatedObject(self, kAutoActiveKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         [self attachStopTouchGesture];
         [self setupAutoDisableTimer];
@@ -1595,12 +1624,16 @@ void openSimpleMenu() {
             CFTimeInterval nowE = CACurrentMediaTime();
             id waitStart = objc_getAssociatedObject(self, kEdgeWaitKey);
             if (!waitStart) {
+                uscProbe(@"到底·自有驱动 进入贴边等待 speedType=%d y=%.1f max=%.1f 高=%.1f",
+                         scrollSpeedType, self.contentOffset.y, maxOffset, self.contentSize.height);
                 objc_setAssociatedObject(self, kEdgeWaitKey, @(nowE), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kEdgeWaitSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 waitStart = @(nowE);
             }
             // 等到了新内容（内容变高）-> 重新起算继续滚
             if (self.contentSize.height - [objc_getAssociatedObject(self, kEdgeWaitSizeKey) doubleValue] > 1.0) {
+                uscProbe(@"到底·自有驱动 等到更多内容(%.1f->%.1f) 继续滚",
+                         [objc_getAssociatedObject(self, kEdgeWaitSizeKey) doubleValue], self.contentSize.height);
                 objc_setAssociatedObject(self, kScrollBaseOffsetKey, @(self.contentOffset.y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kScrollTravelKey, @(0.0), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(self, kContentSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1610,6 +1643,8 @@ void openSimpleMenu() {
             }
             // 等太久还是没新内容 -> 认为真的到底/到顶了（轻震提示）
             if (nowE - [waitStart doubleValue] > kEdgeWaitTimeout) {
+                uscProbe(@"到底·自有驱动 贴边等待%.3fs 仍无更多内容 -> 停(阈值%.2f)",
+                         nowE - [waitStart doubleValue], kEdgeWaitTimeout);
                 [self stopUIScroller];
                 UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
                 [h impactOccurred];
@@ -1671,6 +1706,8 @@ void openSimpleMenu() {
         double *facPtr = usc_facPtr(self);
         if (!velPtr || !facPtr) {
             // 私有 ivar 不存在（iOS 版本变了）-> 退回自有驱动
+            uscProbe(@"ivar 解析失败 vel=%p fac=%p off(%ld,%ld) -> 永久降级为自有驱动",
+                     velPtr, facPtr, (long)uscVelOffset, (long)uscFacOffset);
             nativeSustainBroken = YES;
             [self stopAutoNative];
             [self startUIScroller];
@@ -1686,22 +1723,43 @@ void openSimpleMenu() {
         }
         double raw = *velPtr;
         double v = fabs(raw);
-        // 贴边即停：offset 连续 kEdgeStallTime 没动 = 滚不动了，速度归零交还系统自然滑停。
-        // （用户确认不要"顶着等"：贴边等待已验证对 QQ/微信的懒加载无效。）
+        // ── 到底判据：看「位置是否已贴边」，而不是「位移是否为 0」──
+        // 血泪（第 18 轮，真机现象：固定挡到底就停、自动档到底还会多拉一下）：
+        // 旧判据是 `if (fabs(y-lastY) > 0.5) 刷新时刻; else if (超时) 停` —— 本行只在
+        // 「这一帧位移 ≤0.5pt」时才去查超时。但自动档**不写 offset**，只把 _verticalVelocity
+        // 每帧续成 target（方向始终不变），所以贴到边界后系统会持续尝试推进/回弹：
+        // 位移每帧都 >0.5pt ⇒ 时刻被反复刷新 ⇒ kEdgeStallTime 永不触发 ⇒ 表现为
+        // 「到底了还一直拉」。固定挡不走这里（它每帧 setContentOffset(edge) 把 y 钉死在
+        // 边界上，位移为 0），所以固定挡没这个问题。
+        // 改为：一旦 y 进入边界（含越界）就**锁存**起点；回弹造成的位移变化不再影响计时；
+        // 只有「内容变长」（App 加载更多）才清锁存、继续滚。
         CGFloat y = self.contentOffset.y;
-        CGFloat lastY = [objc_getAssociatedObject(self, kAutoLastYKey) doubleValue];
-        CFTimeInterval lastT = [objc_getAssociatedObject(self, kAutoLastTKey) doubleValue];
         CFTimeInterval now = CACurrentMediaTime();
-        if (fabs(y - lastY) > 0.5) {
-            objc_setAssociatedObject(self, kAutoLastYKey, @(y), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            objc_setAssociatedObject(self, kAutoLastTKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        } else if (lastT > 0.0 && now - lastT > kEdgeStallTime) {
-            *velPtr = 0.0;
-            [self stopAutoNative];
-            // 到头提示：轻震一下，不用盯着看才知道自动滚动停了
-            UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-            [h impactOccurred];
-            return;
+        UIEdgeInsets eIns = self.adjustedContentInset;
+        CGFloat eMin = -eIns.top;
+        CGFloat eMax = MAX(eMin, self.contentSize.height + eIns.bottom - CGRectGetHeight(self.bounds));
+        if (y >= eMax - 1.0 || y <= eMin + 1.0) {
+            NSNumber *edgeT = objc_getAssociatedObject(self, kAutoEdgeStartKey);
+            if (!edgeT) {
+                objc_setAssociatedObject(self, kAutoEdgeStartKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kAutoEdgeSizeKey, @(self.contentSize.height), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                edgeT = @(now);
+            } else if (self.contentSize.height - [objc_getAssociatedObject(self, kAutoEdgeSizeKey) doubleValue] > 1.0) {
+                // 贴边之后 App 又插入了新内容（加载更多）-> 清锁存，重新起算继续滚
+                uscProbe(@"到底·原生续滚 出现更多内容(%.1f->%.1f) -> 继续滚",
+                         [objc_getAssociatedObject(self, kAutoEdgeSizeKey) doubleValue], self.contentSize.height);
+                objc_setAssociatedObject(self, kAutoEdgeStartKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(self, kAutoEdgeSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            } else if (now - [edgeT doubleValue] > kEdgeStallTime) {
+                uscProbe(@"到底·原生续滚 贴边持续=%.3fs(阈值%.2f) y=%.1f eMax=%.1f v=%.4f -> 停",
+                         now - [edgeT doubleValue], kEdgeStallTime, y, eMax, v);
+                *velPtr = 0.0;
+                [self stopAutoNative];
+                // 到头提示：轻震一下，不用盯着看才知道自动滚动停了
+                UIImpactFeedbackGenerator *h = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+                [h impactOccurred];
+                return;
+            }
         }
         // 恒速目标：松手瞬间 pan 手势的实测速度（pt/s，接管入口存好），换算 pt/ms 并封顶
         double v0ptps = [objc_getAssociatedObject(self, kAutoV0Key) doubleValue];
@@ -1737,6 +1795,18 @@ void openSimpleMenu() {
         [executablePath containsString:@"/Applications/"]) {
         uscLoadPrefs(); // 载入持久化设置：力道倍率 / 角落位置（per-App，每个 App 各自一份）
                         // 不持久化的四项用声明处默认值：档位=自动档(4)、挡位微调=0、常亮=NO、自动停止=0
+        // ── 自动档能力自检（只打日志，不改行为）：决定 nativeSustainBroken 会不会被置 YES ──
+        // 必须在 %init 之前跑，看到的才是 UIKit 原始状态。
+        {
+            Ivar vIv = class_getInstanceVariable([UIScrollView class], "_verticalVelocity");
+            Ivar fIv = class_getInstanceVariable([UIScrollView class], "_decelerationFactor");
+            Method mSm = class_getInstanceMethod([UIScrollView class], @selector(_smoothScrollWithUpdateTime:));
+            uscProbe(@"自检 cls=%@ vel=%@(off=%ld) fac=%@(off=%ld) smooth=%@",
+                     [UIScrollView class] ? @"有" : @"无",
+                     vIv ? @"有" : @"无", (long)(vIv ? ivar_getOffset(vIv) : -1),
+                     fIv ? @"有" : @"无", (long)(fIv ? ivar_getOffset(fIv) : -1),
+                     mSm ? @"有" : @"无");
+        }
         %init;
         // 只有确认 UIScrollView 真的实现了这个私有方法，才挂载"续住系统动画"的钩子
         if (class_getInstanceMethod([UIScrollView class], @selector(_smoothScrollWithUpdateTime:))) {
